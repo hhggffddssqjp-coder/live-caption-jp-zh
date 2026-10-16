@@ -1653,6 +1653,7 @@ class Worker(threading.Thread):
         self._stop.set()
 
     def run(self):
+        failures = 0  # 連續失敗幾句；成功一句就歸零
         while not self._stop.is_set():
             if self.pause_state is not None and self.pause_state.is_paused():
                 time.sleep(0.1)
@@ -1662,59 +1663,80 @@ class Worker(threading.Thread):
             except queue.Empty:
                 continue
 
-            segments, _ = self.asr.transcribe(
-                audio,
-                language="ja",
-                vad_filter=False,
-                beam_size=WHISPER_BEAM_SIZE,
-                condition_on_previous_text=False,  # 避免長時間播放時的重複幻覺
-                # Whisper 原生規則：「沒人說話機率 > 0.6」而且「平均信心 < -1.0」才當成
-                # 沒人講話丟掉。不要再自己加「no_speech_prob > 0.6 就整句丟」——large-v3
-                # 遇到背景音樂常給真正的人聲 0.6~0.9 的 no_speech_prob，實測 74 句裡有
-                # 13 句清楚的人聲被這樣誤丟（信心都在 -0.5 以上，turbo 也辨識出一樣的內容）
-                no_speech_threshold=0.6,
-                log_prob_threshold=-1.0,
-            )
-            segments = list(segments)
-            ja_text = "".join(seg.text for seg in segments).strip()
-            if not ja_text or ja_text in _HALLUCINATION_DENYLIST:
-                continue
+            # 任何一句出錯都不能讓這條執行緒結束：以前辨識或翻譯丟出例外（例如第一次
+            # 辨識就遇到 cublas64_12.dll 找不到），Worker 會無聲無息地停掉，畫面照播、
+            # 字幕卻再也不出現，使用者很難察覺
+            try:
+                self._process_utterance(audio, capture_time)
+                failures = 0
+            except Exception as e:
+                failures += 1
+                print(f"處理這一句時發生錯誤（第 {failures} 次連續失敗），先跳過：{type(e).__name__}: {e}")
+                hint = ""
+                if "cublas" in str(e).lower() or "cudnn" in str(e).lower():
+                    hint = "缺少 CUDA 函式庫，請照 README「安裝」第 1 步最後那段補上 cuBLAS"
+                    print(hint)
+                # 第一次失敗、之後每 10 次，在字幕列顯示一次，讓使用者知道字幕為什麼沒出來
+                if failures == 1 or failures % 10 == 0:
+                    self.caption_queue.put((
+                        time.time(), f"⚠ 辨識或翻譯失敗：{type(e).__name__}（詳見終端機）", hint,
+                    ))
 
-            # 除了固定的黑名單詞組，還要防「連續好幾句都一模一樣」這種一般性的
-            # 幻覺迴圈——不管卡住的是哪句話，只要連續重複就先濾掉，不要真的塞進
-            # queue 裡把畫面灌爆；等真的出現新內容，偵測會自動解除
-            self._recent_ja_texts.append(ja_text)
-            if (
-                len(self._recent_ja_texts) == self._recent_ja_texts.maxlen
-                and len(set(self._recent_ja_texts)) == 1
-            ):
-                if not self._hallucination_loop_warned:
-                    self._hallucination_loop_warned = True
-                    print(
-                        f"偵測到 Whisper 疑似卡進幻覺迴圈（連續辨識出同一句「{ja_text}」），"
-                        f"暫時濾掉不顯示；等真的出現新內容會自動恢復正常。"
-                    )
-                continue
-            self._hallucination_loop_warned = False
+    def _process_utterance(self, audio, capture_time: float) -> None:
+        """辨識 + 翻譯一句話，結果送進字幕列、逐字稿面板，並寫入逐字稿檔"""
+        segments, _ = self.asr.transcribe(
+            audio,
+            language="ja",
+            vad_filter=False,
+            beam_size=WHISPER_BEAM_SIZE,
+            condition_on_previous_text=False,  # 避免長時間播放時的重複幻覺
+            # Whisper 原生規則：「沒人說話機率 > 0.6」而且「平均信心 < -1.0」才當成
+            # 沒人講話丟掉。不要再自己加「no_speech_prob > 0.6 就整句丟」——large-v3
+            # 遇到背景音樂常給真正的人聲 0.6~0.9 的 no_speech_prob，實測 74 句裡有
+            # 13 句清楚的人聲被這樣誤丟（信心都在 -0.5 以上，turbo 也辨識出一樣的內容）
+            no_speech_threshold=0.6,
+            log_prob_threshold=-1.0,
+        )
+        segments = list(segments)
+        ja_text = "".join(seg.text for seg in segments).strip()
+        if not ja_text or ja_text in _HALLUCINATION_DENYLIST:
+            return
 
-            # 這句話該在幾點幾分顯示：開口的當下 + 延遲播放秒數，跟畫面/聲音用同一個延遲值，
-            # 三者才會對在一起。如果翻譯花的時間比這個還久，release_at 會排到過去，
-            # 視窗會直接顯示（不會反而更晚跳出）
-            release_at = capture_time + DISPLAY_DELAY_SEC
+        # 除了固定的黑名單詞組，還要防「連續好幾句都一模一樣」這種一般性的
+        # 幻覺迴圈——不管卡住的是哪句話，只要連續重複就先濾掉，不要真的塞進
+        # queue 裡把畫面灌爆；等真的出現新內容，偵測會自動解除
+        self._recent_ja_texts.append(ja_text)
+        if (
+            len(self._recent_ja_texts) == self._recent_ja_texts.maxlen
+            and len(set(self._recent_ja_texts)) == 1
+        ):
+            if not self._hallucination_loop_warned:
+                self._hallucination_loop_warned = True
+                print(
+                    f"偵測到 Whisper 疑似卡進幻覺迴圈（連續辨識出同一句「{ja_text}」），"
+                    f"暫時濾掉不顯示；等真的出現新內容會自動恢復正常。"
+                )
+            return
+        self._hallucination_loop_warned = False
 
-            # 看過前一句上下文，準確度比單句翻譯好，而且是逐句對齊的乾淨結果；
-            # 逐字稿面板、畫面下方字幕列都用同一份結果，不用多算一次
-            # （字幕列以前會把最近幾句接起來整段重翻，除了拖慢速度，塞太多字
-            # 也會把固定高度的字幕區撐爆，所以改成只顯示當下這一句就好）
-            zh_final = self.translator.translate_with_context(self.prev_ja, ja_text, self.glossary)
-            self.prev_ja = ja_text
-            self.transcript_queue.put((release_at, ja_text, zh_final))
-            self.caption_queue.put((release_at, ja_text, zh_final))
+        # 這句話該在幾點幾分顯示：開口的當下 + 延遲播放秒數，跟畫面/聲音用同一個延遲值，
+        # 三者才會對在一起。如果翻譯花的時間比這個還久，release_at 會排到過去，
+        # 視窗會直接顯示（不會反而更晚跳出）
+        release_at = capture_time + DISPLAY_DELAY_SEC
 
-            with open(self.log_path, "a", encoding="utf-8") as f:
-                ts = datetime.datetime.now().strftime("%H:%M:%S")
-                f.write(f"[{ts}] JP: {ja_text}\n")
-                f.write(f"[{ts}] ZH: {zh_final}\n\n")
+        # 看過前一句上下文，準確度比單句翻譯好，而且是逐句對齊的乾淨結果；
+        # 逐字稿面板、畫面下方字幕列都用同一份結果，不用多算一次
+        # （字幕列以前會把最近幾句接起來整段重翻，除了拖慢速度，塞太多字
+        # 也會把固定高度的字幕區撐爆，所以改成只顯示當下這一句就好）
+        zh_final = self.translator.translate_with_context(self.prev_ja, ja_text, self.glossary)
+        self.prev_ja = ja_text
+        self.transcript_queue.put((release_at, ja_text, zh_final))
+        self.caption_queue.put((release_at, ja_text, zh_final))
+
+        with open(self.log_path, "a", encoding="utf-8") as f:
+            ts = datetime.datetime.now().strftime("%H:%M:%S")
+            f.write(f"[{ts}] JP: {ja_text}\n")
+            f.write(f"[{ts}] ZH: {zh_final}\n\n")
 
 
 class PlayerWindow:

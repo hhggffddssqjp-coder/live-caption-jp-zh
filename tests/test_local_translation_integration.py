@@ -573,6 +573,39 @@ class WorkflowWiringTests(TranslationBackendTestCase):
 		self.assertEqual(ja, "していく番組です")
 		self.assertEqual(zh, "這是會這樣做下去的節目。")
 
+	def test_worker_keeps_running_after_an_error_and_shows_a_warning(self):
+		import time
+		segment = FakeSegment(0, "よろしく")
+		segment.no_speech_prob = 0.1
+		segment.avg_logprob = -0.1
+		translator = mock.Mock()
+		translator.translate_with_context.return_value = "請多指教"
+		utterances, captions = queue.Queue(), queue.Queue()
+		with mock.patch.object(self.app, "load_glossary", return_value={}), \
+				tempfile.TemporaryDirectory() as temp_dir, \
+				mock.patch.object(self.app, "TRANSCRIPT_DIR", Path(temp_dir)), \
+				mock.patch("builtins.print") as printed:
+			worker = self.app.Worker(utterances, captions, queue.Queue(), translator=translator)
+			worker.asr = mock.Mock()
+			worker.asr.transcribe.side_effect = [
+				RuntimeError("Library cublas64_12.dll is not found or cannot be loaded"),
+				([segment], None),
+			]
+			worker.start()
+			utterances.put(([0.0] * 16000, time.time()))
+			utterances.put(([0.0] * 16000, time.time()))
+			try:
+				warning = captions.get(timeout=5)
+				caption = captions.get(timeout=5)
+			finally:
+				worker.stop()
+				worker.join(timeout=5)
+		self.assertFalse(worker.is_alive())
+		self.assertIn("失敗", warning[1])
+		self.assertIn("cuBLAS", warning[2])
+		self.assertEqual(caption[1:], ("よろしく", "請多指教"))
+		self.assertIn("cuBLAS", " ".join(str(c.args) for c in printed.call_args_list))
+
 
 
 if __name__ == "__main__":
