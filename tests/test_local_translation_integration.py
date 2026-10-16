@@ -534,6 +534,33 @@ class AudioRoutingTests(TranslationBackendTestCase):
 		self.assertEqual(self.app.find_output_device("CABLE Input", SOUND_ROWS), "VB-Audio Virtual Cable\\Device\\CABLE Input\\Render")
 		self.assertIsNone(self.app.find_output_device("不存在的裝置", SOUND_ROWS))
 
+	def test_restorer_switches_back_only_once(self):
+		with mock.patch.object(self.app, "set_app_output_device", return_value=True) as set_device, \
+				mock.patch("builtins.print"):
+			restore = self.app.AudioRoutingRestorer("brave.exe", "Realtek(R) Audio\\Device\\耳機\\Render")
+			restore()
+			restore()  # finally + atexit + console handler may all fire
+		set_device.assert_called_once_with("brave.exe", "Realtek(R) Audio\\Device\\耳機\\Render")
+
+	def test_restorer_falls_back_to_the_system_default_device(self):
+		with mock.patch.object(self.app, "set_app_output_device", return_value=True) as set_device, \
+				mock.patch.object(self.app, "get_default_output_device", return_value="FxSound Audio Enhancer\\Device\\喇叭\\Render"), \
+				mock.patch("builtins.print"):
+			self.app.AudioRoutingRestorer("brave.exe", None)()
+		set_device.assert_called_once_with("brave.exe", "FxSound Audio Enhancer\\Device\\喇叭\\Render")
+
+	def test_console_close_event_runs_the_restorer(self):
+		handlers = []
+		win32api = types.SimpleNamespace(SetConsoleCtrlHandler=lambda handler, add: handlers.append(handler))
+		win32con = types.SimpleNamespace(
+			CTRL_C_EVENT=0, CTRL_BREAK_EVENT=1, CTRL_CLOSE_EVENT=2, CTRL_LOGOFF_EVENT=5, CTRL_SHUTDOWN_EVENT=6,
+		)
+		callback = mock.Mock()
+		with mock.patch.dict(sys.modules, {"win32api": win32api, "win32con": win32con}):
+			self.app._install_console_close_handler(callback)
+		self.assertFalse(handlers[0](2))  # CTRL_CLOSE_EVENT: run it, but let Windows continue
+		callback.assert_called_once_with()
+
 
 class WorkflowWiringTests(TranslationBackendTestCase):
 	def test_worker_reuses_injected_translator_without_constructing_another(self):

@@ -86,6 +86,7 @@ live_caption_gemini.py
     任何聲音。這個小聲的背景音通常不會很干擾，習慣了就好。
 """
 
+import atexit
 import math
 import os
 import sys
@@ -755,6 +756,62 @@ def set_app_output_device(process_name: str, device_name: str) -> bool:
     except Exception as e:
         print(f"切換 {process_name} 輸出裝置失敗：{e}")
         return False
+
+
+class AudioRoutingRestorer:
+    """把來源程式（瀏覽器）的輸出裝置切回原本的，而且只會做一次。
+
+    同一個實例會掛在好幾個地方：main() 的 finally、atexit、主控台的關閉 / Ctrl+C 事件。
+    哪一個先觸發都可以，之後的呼叫什麼都不做，不會重複切換。開始時查不到原本的
+    裝置（瀏覽器那時沒在播放），就切回系統預設的播放裝置。
+    """
+
+    def __init__(self, process_name: str, original_device: str | None):
+        self.process_name = process_name
+        self.original_device = original_device
+        self._lock = threading.Lock()
+        self._done = False
+
+    def __call__(self) -> None:
+        with self._lock:
+            if self._done:
+                return
+            self._done = True
+        restore_device = self.original_device or get_default_output_device()
+        if restore_device and set_app_output_device(self.process_name, restore_device):
+            print(f"已把 {self.process_name} 的輸出裝置切回「{restore_device}」。")
+        else:
+            print(f"沒辦法自動切回 {self.process_name} 的輸出裝置，可能需要自己在音量混音器裡切回來。")
+
+
+def _install_console_close_handler(callback) -> None:
+    """主控台視窗被直接關掉、按 Ctrl+C、登出或關機時，先執行 callback。
+
+    直接關掉主控台時 Windows 會直接結束行程，finally 和 atexit 都不會跑；
+    這個事件處理器是唯一的機會（Windows 大約給 5 秒，夠呼叫 SoundVolumeView）。
+    回傳 False，讓 Ctrl+C 照常變成 KeyboardInterrupt。
+    """
+    try:
+        import win32api
+        import win32con
+    except ImportError:
+        return
+
+    def handler(ctrl_type):
+        if ctrl_type in (
+            win32con.CTRL_C_EVENT, win32con.CTRL_BREAK_EVENT, win32con.CTRL_CLOSE_EVENT,
+            win32con.CTRL_LOGOFF_EVENT, win32con.CTRL_SHUTDOWN_EVENT,
+        ):
+            try:
+                callback()
+            except Exception as e:
+                print(f"結束時切回音訊輸出失敗：{e}")
+        return False
+
+    try:
+        win32api.SetConsoleCtrlHandler(handler, True)
+    except Exception as e:
+        print(f"沒辦法攔截主控台關閉事件（直接關掉視窗時可能不會切回音訊輸出）：{e}")
 
 
 class PauseState:
@@ -2159,39 +2216,9 @@ def main():
         print(f"翻譯引擎初始化失敗：{e}")
         sys.exit(1)
 
-    using_virtual_cable = bool(input_device and "CABLE" in input_device["name"].upper())
-    original_output_device = None
-    source_process_name = None
-
-    if using_virtual_cable:
-        try:
-            import psutil
-            source_process_name = psutil.Process(pid).name()
-        except Exception:
-            source_process_name = None
-
-        if source_process_name and SOUND_VOLUME_VIEW_PATH.exists():
-            sound_rows = _sound_volume_view_rows()
-            cable_device = find_output_device("CABLE Input", sound_rows) or "CABLE Input"
-            # 瀏覽器現在沒在播放聲音的話查不到（None），結束時就改切回系統預設裝置；
-            # 上次程式沒正常結束、瀏覽器還停在 CABLE 的話，也當成查不到，不要切回 CABLE
-            original_output_device = get_app_output_device(source_process_name, sound_rows)
-            if original_output_device == cable_device:
-                original_output_device = None
-            if set_app_output_device(source_process_name, cable_device):
-                print(f"已自動把 {source_process_name} 的輸出裝置切到虛擬音訊線。")
-                print("提醒：切換裝置指令不會影響「已經在播放」的分頁——")
-                print("請去瀏覽器重新整理一次影片頁面（或暫停再重新播放），聲音才會真的改道過去，不然會抓到全程靜音、字幕不會跑出來。")
-            else:
-                print("自動切換輸出裝置失敗，可能需要自己在 Windows 音量混音器裡手動設定。")
-        else:
-            print("找不到 SoundVolumeView 或來源程式名稱，請自己在 Windows 音量混音器裡把")
-            print("瀏覽器輸出裝置設定成「CABLE Input」。")
-        print("使用虛擬音訊線擷取，不需要調低來源音量。")
-    # 不再自動調低來源音量了；沒用虛擬音訊線分開的話，背景音問題需要自己在
-    # Windows 音量混音器裡手動調整（見 duck_process_volume 函式，保留著沒刪，
-    # 之後想要的話可以自己在這裡重新呼叫）
-
+    # 先把會花很久、也可能失敗的東西都載入好（Silero VAD、Whisper 模型、音訊裝置），
+    # 最後才去切換瀏覽器的音訊輸出：以前是先切換再載入 Whisper，載入失敗或按 Ctrl+C
+    # 就不會走到 finally，瀏覽器會一直停在 CABLE
     buffer_seconds = DISPLAY_DELAY_SEC + BUFFER_MARGIN_SEC
     frame_buffer = FrameBuffer(max_seconds=buffer_seconds)
     # 用擷取裝置的原始取樣率存延遲緩衝，不要用 TARGET_SR（那是 16kHz，給 Whisper
@@ -2224,44 +2251,83 @@ def main():
     # 延遲聲音一定要從「不是被擷取來源」的裝置播出來，不然會變成回音疊加的無限循環
     audio_player = DelayedAudioPlayer(audio_ring, device=output_device, pause_state=pause_state)
 
-    screen_capture.start()
-    audio_capture.start()
-    audio_player.start()
-    worker.start()
+    using_virtual_cable = bool(input_device and "CABLE" in input_device["name"].upper())
+    original_output_device = None
+    source_process_name = None
+    restore_audio_routing = None
 
-    root = tk.Tk()
-    root.title(f"即時中日對照字幕 - {episode_title}" if episode_title else "即時中日對照字幕")
-    root.configure(bg="black")
-    root.minsize(640, 400)
+    if using_virtual_cable:
+        try:
+            import psutil
+            source_process_name = psutil.Process(pid).name()
+        except Exception:
+            source_process_name = None
 
-    # 合併成一個視窗：播放畫面（左）+ 逐字稿（右）用 PanedWindow 隔開，中間那條
-    # 分隔線可以直接拖曳調整兩邊比例，初始比例沿用原本兩個獨立視窗的大小分配
-    screen_w = root.winfo_screenwidth()
-    screen_h = root.winfo_screenheight()
-    transcript_w = min(520, screen_w // 3)
-    player_w = max(480, screen_w - transcript_w - 60)
-    root.geometry(f"{screen_w - 40}x{screen_h - 100}+20+20")
-
-    paned = tk.PanedWindow(
-        root, orient="horizontal", sashwidth=6, sashrelief="raised",
-        bg="#333333", showhandle=False,
-    )
-    left_frame = tk.Frame(paned, bg="black")
-    right_frame = tk.Frame(paned, bg="#111111")
-    paned.add(left_frame, minsize=320, width=player_w)
-    paned.add(right_frame, minsize=200, width=transcript_w)
-
-    # PlayerWindow 會先把控制按鈕列 pack 進 root 最上方，接著 paned 才 pack 進來
-    # 填滿剩下的空間，上下順序才會對（按鈕列要固定在最頂端，不會被分隔線蓋住）
-    PlayerWindow(
-        root, left_frame, frame_buffer, caption_queue, episode_title,
-        pause_state=pause_state, screen_capture=screen_capture, audio_capture=audio_capture,
-    )
-    paned.pack(fill="both", expand=True)
-
-    TranscriptWindow(right_frame, transcript_queue, episode_title)
+        if source_process_name and SOUND_VOLUME_VIEW_PATH.exists():
+            sound_rows = _sound_volume_view_rows()
+            cable_device = find_output_device("CABLE Input", sound_rows) or "CABLE Input"
+            # 瀏覽器現在沒在播放聲音的話查不到（None），結束時就改切回系統預設裝置；
+            # 上次程式沒正常結束、瀏覽器還停在 CABLE 的話，也當成查不到，不要切回 CABLE
+            original_output_device = get_app_output_device(source_process_name, sound_rows)
+            if original_output_device == cable_device:
+                original_output_device = None
+            # 切換之前先準備好「只會執行一次」的還原，掛在 atexit 和主控台關閉事件上；
+            # 下面的 try/finally 也會呼叫它。哪個先觸發都可以，Brave 不會卡在 CABLE
+            restore_audio_routing = AudioRoutingRestorer(source_process_name, original_output_device)
+            atexit.register(restore_audio_routing)
+            _install_console_close_handler(restore_audio_routing)
+            if set_app_output_device(source_process_name, cable_device):
+                print(f"已自動把 {source_process_name} 的輸出裝置切到虛擬音訊線。")
+                print("提醒：切換裝置指令不會影響「已經在播放」的分頁——")
+                print("請去瀏覽器重新整理一次影片頁面（或暫停再重新播放），聲音才會真的改道過去，不然會抓到全程靜音、字幕不會跑出來。")
+            else:
+                print("自動切換輸出裝置失敗，可能需要自己在 Windows 音量混音器裡手動設定。")
+        else:
+            print("找不到 SoundVolumeView 或來源程式名稱，請自己在 Windows 音量混音器裡把")
+            print("瀏覽器輸出裝置設定成「CABLE Input」。")
+        print("使用虛擬音訊線擷取，不需要調低來源音量。")
+    # 不再自動調低來源音量了；沒用虛擬音訊線分開的話，背景音問題需要自己在
+    # Windows 音量混音器裡手動調整（見 duck_process_volume 函式，保留著沒刪，
+    # 之後想要的話可以自己在這裡重新呼叫）
 
     try:
+        screen_capture.start()
+        audio_capture.start()
+        audio_player.start()
+        worker.start()
+
+        root = tk.Tk()
+        root.title(f"即時中日對照字幕 - {episode_title}" if episode_title else "即時中日對照字幕")
+        root.configure(bg="black")
+        root.minsize(640, 400)
+
+        # 合併成一個視窗：播放畫面（左）+ 逐字稿（右）用 PanedWindow 隔開，中間那條
+        # 分隔線可以直接拖曳調整兩邊比例，初始比例沿用原本兩個獨立視窗的大小分配
+        screen_w = root.winfo_screenwidth()
+        screen_h = root.winfo_screenheight()
+        transcript_w = min(520, screen_w // 3)
+        player_w = max(480, screen_w - transcript_w - 60)
+        root.geometry(f"{screen_w - 40}x{screen_h - 100}+20+20")
+
+        paned = tk.PanedWindow(
+            root, orient="horizontal", sashwidth=6, sashrelief="raised",
+            bg="#333333", showhandle=False,
+        )
+        left_frame = tk.Frame(paned, bg="black")
+        right_frame = tk.Frame(paned, bg="#111111")
+        paned.add(left_frame, minsize=320, width=player_w)
+        paned.add(right_frame, minsize=200, width=transcript_w)
+
+        # PlayerWindow 會先把控制按鈕列 pack 進 root 最上方，接著 paned 才 pack 進來
+        # 填滿剩下的空間，上下順序才會對（按鈕列要固定在最頂端，不會被分隔線蓋住）
+        PlayerWindow(
+            root, left_frame, frame_buffer, caption_queue, episode_title,
+            pause_state=pause_state, screen_capture=screen_capture, audio_capture=audio_capture,
+        )
+        paned.pack(fill="both", expand=True)
+
+        TranscriptWindow(right_frame, transcript_queue, episode_title)
+
         root.mainloop()
     except KeyboardInterrupt:
         pass
@@ -2269,22 +2335,20 @@ def main():
         screen_capture.stop()
         audio_capture.stop()
         audio_player.stop()
-        if worker is not None:
-            worker.stop()
+        worker.stop()
 
-        if source_process_name and SOUND_VOLUME_VIEW_PATH.exists():
-            # 結束時把來源程式的輸出裝置切回原本的；開始時查不到原本的裝置（瀏覽器
-            # 那時沒在播放），就切回系統預設的播放裝置，不留下要自己手動改回去的麻煩
-            restore_device = original_output_device or get_default_output_device()
-            if restore_device and set_app_output_device(source_process_name, restore_device):
-                print(f"已把 {source_process_name} 的輸出裝置切回「{restore_device}」。")
-            else:
-                print(f"沒辦法自動切回 {source_process_name} 的輸出裝置，可能需要自己在音量混音器裡切回來。")
+        # 結束時把來源程式的輸出裝置切回原本的（AudioRoutingRestorer 只會切一次）
+        if restore_audio_routing is not None:
+            restore_audio_routing()
 
-        worker.join(timeout=5)  # 等背景執行緒真的寫完檔案，再去讀來整理
+        # 等背景執行緒真的寫完檔案，再去讀來整理（中途出錯時執行緒可能根本還沒啟動，
+        # 對沒啟動過的執行緒呼叫 join() 會丟出例外，蓋掉原本的錯誤）
+        if worker.ident is not None:
+            worker.join(timeout=5)
         # 完整錄音的 WAV 檔要等 AudioCapture 執行緒真的跑完、把檔案關閉寫入磁碟，
         # 才能安全地拿去重新辨識——不然可能讀到還沒寫完、不完整的檔案
-        audio_capture.join(timeout=5)
+        if audio_capture.ident is not None:
+            audio_capture.join(timeout=5)
         print("已停止擷取，逐字稿已存檔。")
 
         try:
