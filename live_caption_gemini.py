@@ -1163,6 +1163,7 @@ class AudioCapture(threading.Thread):
         # 轉檔），事後重新辨識用途足夠，比存原始取樣率省很多硬碟空間
         self._record_path = record_path
         self._wav_writer = None
+        self._recording = False  # 「停止錄製」只是暫停寫入，檔案留著開，下次開始接著寫
         self._wav_lock = threading.Lock()
 
         print("載入語音活動偵測模型（Silero VAD，第一次執行會自動下載）...")
@@ -1177,31 +1178,50 @@ class AudioCapture(threading.Thread):
         self._stop = threading.Event()
 
     def start_recording(self) -> bool:
-        """手動開始錄製完整音訊；已經在錄、或沒有指定檔名的話回傳 False"""
+        """手動開始錄製完整音訊；已經在錄、或沒有指定檔名的話回傳 False。
+
+        只有第一次才開檔。以前每次開始都用 "wb" 重開同一個檔名，錄、停、再錄
+        就會把前一段整個清掉；現在多段錄音會依序接在同一個檔案裡。
+        """
         if self._record_path is None:
             return False
         with self._wav_lock:
-            if self._wav_writer is not None:
+            if self._recording:
                 return False
-            writer = wave.open(str(self._record_path), "wb")
-            writer.setnchannels(1)
-            writer.setsampwidth(2)  # int16
-            writer.setframerate(TARGET_SR)
-            self._wav_writer = writer
+            if self._wav_writer is None:
+                writer = wave.open(str(self._record_path), "wb")
+                writer.setnchannels(1)
+                writer.setsampwidth(2)  # int16
+                writer.setframerate(TARGET_SR)
+                self._wav_writer = writer
+            self._recording = True
         return True
 
     def stop_recording(self) -> bool:
-        """手動停止錄製；本來就沒在錄的話回傳 False"""
+        """手動停止錄製（暫停寫入，檔案在程式結束時才關閉）；本來就沒在錄的話回傳 False"""
         with self._wav_lock:
-            if self._wav_writer is None:
+            if not self._recording:
                 return False
-            self._wav_writer.close()
-            self._wav_writer = None
+            self._recording = False
         return True
 
     def is_recording(self) -> bool:
         with self._wav_lock:
-            return self._wav_writer is not None
+            return self._recording
+
+    def _write_recording(self, audio_16k) -> None:
+        """錄製中才把這一段 16kHz 單聲道音訊寫進 WAV"""
+        with self._wav_lock:
+            if self._recording and self._wav_writer is not None:
+                pcm16 = np.clip(audio_16k * 32767, -32768, 32767).astype(np.int16)
+                self._wav_writer.writeframes(pcm16.tobytes())
+
+    def _close_recording(self) -> None:
+        with self._wav_lock:
+            self._recording = False
+            if self._wav_writer is not None:
+                self._wav_writer.close()
+                self._wav_writer = None
 
     def _pick_loopback_device(self):
         if self._preferred_name:
@@ -1314,10 +1334,7 @@ class AudioCapture(threading.Thread):
 
             audio_16k = resample_linear(audio, self.stream_sr, TARGET_SR)
 
-            with self._wav_lock:
-                if self._wav_writer is not None:
-                    pcm16 = np.clip(audio_16k * 32767, -32768, 32767).astype(np.int16)
-                    self._wav_writer.writeframes(pcm16.tobytes())
+            self._write_recording(audio_16k)
 
             pending = np.concatenate([pending, audio_16k])
 
@@ -1360,10 +1377,7 @@ class AudioCapture(threading.Thread):
         stream.stop_stream()
         stream.close()
         self.pa.terminate()
-        with self._wav_lock:
-            if self._wav_writer is not None:
-                self._wav_writer.close()
-                self._wav_writer = None
+        self._close_recording()
 
 
 _SYSTEM_PROMPT_BASE = (
@@ -1775,7 +1789,7 @@ class PlayerWindow:
         if self.audio_capture.is_recording():
             self.audio_capture.stop_recording()
             self.record_btn.config(text="⏺ 開始錄製")
-            print("已停止錄製完整音訊。")
+            print("已暫停錄製完整音訊（再按一次會接著錄在同一個檔案裡）。")
         else:
             if self.audio_capture.start_recording():
                 self.record_btn.config(text="⏹ 停止錄製")

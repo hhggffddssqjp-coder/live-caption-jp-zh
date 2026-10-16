@@ -437,6 +437,60 @@ SOUND_ROWS = [
 ]
 
 
+class _FakeAudio:
+	"""Stands in for a numpy float array: numpy is stubbed in this test module."""
+
+	def __init__(self, samples):
+		self.samples = samples
+
+	def __mul__(self, _):
+		return self
+
+	def astype(self, _):
+		return self
+
+	def tobytes(self):
+		return b"\x00\x00" * self.samples
+
+
+class RecordingTests(TranslationBackendTestCase):
+	def make_capture(self, record_path):
+		capture = object.__new__(self.app.AudioCapture)  # skip PyAudio / VAD setup
+		capture._record_path = record_path
+		capture._wav_writer = None
+		capture._recording = False
+		capture._wav_lock = __import__("threading").Lock()
+		return capture
+
+	def test_stop_then_start_again_appends_instead_of_overwriting(self):
+		import wave
+		fake_np = types.SimpleNamespace(clip=lambda x, *_: x, int16="int16")
+		with tempfile.TemporaryDirectory() as temp_dir, mock.patch.object(self.app, "np", fake_np):
+			path = Path(temp_dir) / "transcript_audio.wav"
+			capture = self.make_capture(path)
+			self.assertTrue(capture.start_recording())
+			capture._write_recording(_FakeAudio(16000))
+			self.assertTrue(capture.stop_recording())
+			capture._write_recording(_FakeAudio(8000))  # not recording: must be skipped
+			self.assertTrue(capture.start_recording())
+			capture._write_recording(_FakeAudio(4000))
+			capture._close_recording()
+			with wave.open(str(path), "rb") as wav:
+				self.assertEqual(wav.getnframes(), 16000 + 4000)
+
+	def test_recording_flags(self):
+		with tempfile.TemporaryDirectory() as temp_dir:
+			capture = self.make_capture(Path(temp_dir) / "a.wav")
+			self.assertFalse(capture.stop_recording())
+			self.assertTrue(capture.start_recording())
+			self.assertFalse(capture.start_recording())
+			self.assertTrue(capture.is_recording())
+			capture.stop_recording()
+			self.assertFalse(capture.is_recording())
+			capture._close_recording()
+		self.assertFalse(self.make_capture(None).start_recording())
+
+
 class AudioRoutingTests(TranslationBackendTestCase):
 	def test_app_device_is_found_by_process_path_not_display_name(self):
 		self.assertEqual(self.app.get_app_output_device("brave.exe", SOUND_ROWS),
