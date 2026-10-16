@@ -116,7 +116,9 @@ from PIL import Image, ImageTk
 
 from faster_whisper import WhisperModel
 from silero_vad import load_silero_vad, VADIterator
-from local_translation import LocalTranslationEngine, translation_problem
+from local_translation import (
+    LocalTranslationEngine, bilingual_pairs_acceptable, parse_bilingual_pairs, translation_problem,
+)
 from llama_server import LlamaServerError, ensure_llama_server
 
 # The Gemini SDK is imported only when the Gemini backend is chosen, so local-model
@@ -470,11 +472,26 @@ def _rebuild_user_prompt(batch: list[str], context_tail: str) -> str:
 	) + "請處理這一批句子：\n" + "\n".join(batch)
 
 
+def _gemini_reply_truncated(response) -> bool:
+    """Gemini 是不是因為輸出 token 上限才停下來（回覆被截斷、後面的句子不見了）"""
+    try:
+        reason = response.candidates[0].finish_reason
+    except (AttributeError, IndexError, TypeError):
+        return False
+    return "MAX_TOKENS" in str(getattr(reason, "name", reason)).upper()
+
+
 def _polish_with_gemini(
-    translator: "Translator", ja_lines: list[str], system_prompt: str
+    translator: "Translator", ja_lines: list[str], system_prompt: str, glossary: dict | None = None,
 ) -> tuple[list[str], int]:
-    """回傳 (整理好的段落, 重試 3 次仍失敗的批數)。失敗批數大於 0 時，呼叫端
-    要保留完整錄音，不然那幾批的內容就永遠找不回來了。"""
+    """回傳 (整理好的段落, 重試 3 次仍不完整的批數)。失敗批數大於 0 時，呼叫端
+    要保留完整錄音，不然那幾批的內容就永遠找不回來了。
+
+    以前只要回覆不是空字串就算成功；被輸出上限截斷、少了好幾句、或夾帶說明文字
+    的回覆也照收，錄音照刪。現在每一批都跟本機模型一樣，用 parse_bilingual_pairs +
+    bilingual_pairs_acceptable 檢查句數和翻譯；不合格就重試，重試完還是不合格，
+    就把最後一次的結果放進整理稿（總比整批空白好），但算成失敗、保留錄音。
+    """
     polished_parts = []
     failed_batches = 0
     context_tail = ""
@@ -486,19 +503,30 @@ def _polish_with_gemini(
         # 這裡跟即時字幕不一樣：這是背景整理工作，不趕時間，撞到免費額度限制
         # 的話等久一點重試，把它做完比做快更重要——所以不用 translator._chat
         # 那個「立刻放棄」的快速失敗邏輯，這裡自己重試
-        result = ""
+        result, complete = "", False
         for attempt in range(3):
-            result = translator._chat(system_prompt, user_prompt, timeout_sec=GEMINI_BATCH_TIMEOUT_SEC)
-            if result:
-                break
-            print(f"  第 {batch_no} 批翻譯失敗（可能撞到額度限制），20 秒後重試（第 {attempt + 1} 次）...")
+            reply, truncated = translator._chat_batch(system_prompt, user_prompt)
+            if reply:
+                result = reply
+                complete = not truncated and bilingual_pairs_acceptable(
+                    parse_bilingual_pairs(reply), batch, glossary
+                )
+                if complete:
+                    break
+                why = "回覆被輸出上限截斷" if truncated else "回覆的句數或格式不完整"
+            else:
+                why = "翻譯失敗（可能撞到額度限制）"
+            print(f"  第 {batch_no} 批{why}，20 秒後重試（第 {attempt + 1} 次）...")
             time.sleep(20)
 
         if result:
             polished_parts.append(result)
-        else:
+        if not complete:
             failed_batches += 1
-            print(f"  第 {batch_no} 批重試 3 次仍然失敗，這一批會從整理稿中缺漏")
+            if result:
+                print(f"  第 {batch_no} 批重試 3 次仍然不完整，先放進整理稿，但這一批可能有缺漏")
+            else:
+                print(f"  第 {batch_no} 批重試 3 次仍然失敗，這一批會從整理稿中缺漏")
         context_tail = "\n".join(batch[-2:])
         print(f"  已處理第 {batch_no}/{total_batches} 批")
 
@@ -582,7 +610,7 @@ def rebuild_transcript_from_full_audio(
             print(f"本機模型服務無法使用，已保留完整錄音：{wav_path}")
             return None
     else:
-        polished_parts, failed_batches = _polish_with_gemini(translator, ja_lines, system_prompt)
+        polished_parts, failed_batches = _polish_with_gemini(translator, ja_lines, system_prompt, glossary)
 
     if not polished_parts:
         print(f"翻譯模型沒有回傳任何內容，略過這份整理稿，已保留完整錄音：{wav_path}")
@@ -1593,9 +1621,11 @@ class Translator:
                     http_options=genai_types.HttpOptions(timeout=int(timeout_sec * 1000)),
                 ),
             )
+            self._last_reply_truncated = _gemini_reply_truncated(response)
             result = (response.text or "").strip()
             return _collapse_repetition(result)
         except Exception as e:
+            self._last_reply_truncated = False
             if "timeout" in type(e).__name__.lower() or "timed out" in str(e).lower():
                 print(f"Gemini API 超過 {timeout_sec:g} 秒沒有回應，這句先跳過，下一句會繼續嘗試。")
                 return ""
@@ -1610,6 +1640,13 @@ class Translator:
                 # 這把金鑰目前實際能用的型號，不用回來猜、也不用等我查
                 self._print_available_models()
             return ""
+
+    def _chat_batch(self, system_prompt: str, user_prompt: str) -> tuple[str, bool]:
+        """事後整理用的 Gemini 請求：回傳 (回覆文字, 是否因為輸出上限被截斷)。
+        即時字幕不用這個，行為不變。"""
+        self._last_reply_truncated = False
+        text = self._chat(system_prompt, user_prompt, timeout_sec=GEMINI_BATCH_TIMEOUT_SEC)
+        return text, self._last_reply_truncated
 
     def _print_available_models(self):
         try:

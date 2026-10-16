@@ -48,6 +48,14 @@ class ScriptedClient:
 		return reply
 
 
+def bilingual_reply(contents, tag, keep=None):
+	"""A well-formed rebuild reply for the batch in ``contents``: one "日文\\n中文" block per
+	line. ``keep`` limits how many lines are answered, to simulate an incomplete reply."""
+	batch = contents.split("請處理這一批句子：\n", 1)[1].splitlines()
+	batch = batch if keep is None else batch[:keep]
+	return "\n\n".join(f"{ja}\n{tag}譯文{k}" for k, ja in enumerate(batch))
+
+
 class _GeminiCalls(list):
 	"""generate_content calls; per-request timeouts are kept apart in .timeouts_ms so the
 	exact-match assertions on prompts and parameters stay unchanged."""
@@ -78,6 +86,9 @@ def install_fake_gemini(reply):
 			result = reply(contents, len(calls))
 			if isinstance(result, BaseException):
 				raise result
+			if isinstance(result, tuple):  # (text, finish_reason)
+				text, finish_reason = result
+				return types.SimpleNamespace(text=text, candidates=[types.SimpleNamespace(finish_reason=finish_reason)])
 			return types.SimpleNamespace(text=result)
 
 		def list(self):
@@ -220,7 +231,9 @@ class GeminiPathTests(TranslationBackendTestCase):
 		self.assertEqual(calls.timeouts_ms, [int(self.app.GEMINI_LIVE_TIMEOUT_SEC * 1000)])
 
 	def test_live_captions_and_rebuild_use_their_own_timeouts(self):
-		translator, calls = self.gemini_translator(lambda contents, n: "中文")
+		translator, calls = self.gemini_translator(
+			lambda contents, n: "中文" if n == 1 else bilingual_reply(contents, "x")
+		)
 		translator.translate_with_context("", "よろしく。")
 		self.run_reconstruction(translator, ["日文です。"])
 		self.assertEqual(calls.timeouts_ms, [15000, 120000])
@@ -257,7 +270,9 @@ class GeminiPathTests(TranslationBackendTestCase):
 
 	def test_gemini_reconstruction_keeps_master_batches_retries_and_pacing(self):
 		lines = [f"日文{i}です。" for i in range(61)]
-		translator, calls = self.gemini_translator(lambda contents, n: "" if n == 1 else f"批次{n}")
+		translator, calls = self.gemini_translator(
+			lambda contents, n: "" if n == 1 else bilingual_reply(contents, f"批次{n}")
+		)
 		out_path, wav_path = self.run_reconstruction(translator, lines)
 		self.assertEqual([len(call["contents"].split("請處理這一批句子：\n", 1)[1].splitlines()) for call in calls], [60, 60, 1])
 		self.assertEqual(calls[0]["contents"], "請處理這一批句子：\n" + "\n".join(lines[:60]))
@@ -265,19 +280,52 @@ class GeminiPathTests(TranslationBackendTestCase):
 		self.assertEqual(self.sleeps, [20, 4.5])
 		text = out_path.read_text(encoding="utf-8")
 		self.assertIn("翻譯模型看過完整上下文潤過的版本", text)
-		self.assertTrue(text.endswith("批次2\n\n批次3\n"))
+		self.assertIn("日文59です。\n批次2譯文59", text)
+		self.assertTrue(text.endswith("日文60です。\n批次3譯文0\n"))
 		self.assertFalse(wav_path.exists())
 
 	def test_gemini_reconstruction_keeps_wav_when_a_batch_fails_all_retries(self):
 		lines = [f"日文{i}です。" for i in range(61)]
-		translator, calls = self.gemini_translator(lambda contents, n: "" if n <= 3 else f"批次{n}")
+		translator, calls = self.gemini_translator(
+			lambda contents, n: "" if n <= 3 else bilingual_reply(contents, f"批次{n}")
+		)
 		out_path, wav_path = self.run_reconstruction(translator, lines)
 		self.assertEqual(len(calls), 4)
 		text = out_path.read_text(encoding="utf-8")
 		self.assertIn("有 1 批整理失敗", text)
-		self.assertTrue(text.endswith("批次4\n"))
+		self.assertTrue(text.endswith("日文60です。\n批次4譯文0\n"))
 		self.assertTrue(wav_path.exists())
 		self.assertIn("已保留完整錄音", self.printed_text())
+
+	def test_gemini_reply_covering_only_half_the_batch_keeps_the_wav(self):
+		lines = [f"日文{i}です。" for i in range(20)]
+		translator, calls = self.gemini_translator(lambda contents, n: bilingual_reply(contents, "半", keep=10))
+		out_path, wav_path = self.run_reconstruction(translator, lines)
+		self.assertEqual(len(calls), 3)  # incomplete replies are retried like empty ones
+		self.assertEqual(self.sleeps, [20, 20, 20])
+		text = out_path.read_text(encoding="utf-8")
+		self.assertIn("有 1 批整理失敗", text)
+		self.assertIn("日文9です。\n半譯文9", text)  # the partial result is still kept in the transcript
+		self.assertTrue(wav_path.exists())
+
+	def test_gemini_reply_cut_off_by_the_output_limit_keeps_the_wav(self):
+		lines = [f"日文{i}です。" for i in range(4)]
+		translator, calls = self.gemini_translator(
+			lambda contents, n: (bilingual_reply(contents, "截"), types.SimpleNamespace(name="MAX_TOKENS"))
+		)
+		out_path, wav_path = self.run_reconstruction(translator, lines)
+		self.assertEqual(len(calls), 3)
+		self.assertIn("截斷", self.printed_text())
+		self.assertTrue(wav_path.exists())
+
+	def test_complete_gemini_reply_still_deletes_the_wav(self):
+		lines = [f"日文{i}です。" for i in range(4)]
+		translator, calls = self.gemini_translator(
+			lambda contents, n: (bilingual_reply(contents, "全"), types.SimpleNamespace(name="STOP"))
+		)
+		out_path, wav_path = self.run_reconstruction(translator, lines)
+		self.assertEqual(len(calls), 1)
+		self.assertFalse(wav_path.exists())
 
 
 
