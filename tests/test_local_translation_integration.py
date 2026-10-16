@@ -48,9 +48,30 @@ class ScriptedClient:
 		return reply
 
 
+def bilingual_reply(contents, tag, keep=None):
+	"""A well-formed rebuild reply for the batch in ``contents``: one "日文\\n中文" block per
+	line. ``keep`` limits how many lines are answered, to simulate an incomplete reply."""
+	batch = contents.split("請處理這一批句子：\n", 1)[1].splitlines()
+	batch = batch if keep is None else batch[:keep]
+	return "\n\n".join(f"{ja}\n{tag}譯文{k}" for k, ja in enumerate(batch))
+
+
+class _GeminiCalls(list):
+	"""generate_content calls; per-request timeouts are kept apart in .timeouts_ms so the
+	exact-match assertions on prompts and parameters stay unchanged."""
+
+	def __init__(self):
+		super().__init__()
+		self.timeouts_ms = []
+
+
 def install_fake_gemini(reply):
 	"""Install a google.genai stand-in; returns the list of generate_content calls."""
-	calls = []
+	calls = _GeminiCalls()
+
+	class HttpOptions:
+		def __init__(self, timeout=None):
+			self.timeout = timeout
 
 	class GenerateContentConfig:
 		def __init__(self, **kwargs):
@@ -58,10 +79,16 @@ def install_fake_gemini(reply):
 
 	class Models:
 		def generate_content(self, model, contents, config):
-			calls.append({"model": model, "contents": contents, **config.kwargs})
+			kwargs = dict(config.kwargs)
+			http_options = kwargs.pop("http_options", None)
+			calls.timeouts_ms.append(getattr(http_options, "timeout", None))
+			calls.append({"model": model, "contents": contents, **kwargs})
 			result = reply(contents, len(calls))
 			if isinstance(result, BaseException):
 				raise result
+			if isinstance(result, tuple):  # (text, finish_reason)
+				text, finish_reason = result
+				return types.SimpleNamespace(text=text, candidates=[types.SimpleNamespace(finish_reason=finish_reason)])
 			return types.SimpleNamespace(text=result)
 
 		def list(self):
@@ -78,6 +105,7 @@ def install_fake_gemini(reply):
 	genai_errors = types.ModuleType("google.genai.errors")
 	genai.Client = Client
 	genai_types.GenerateContentConfig = GenerateContentConfig
+	genai_types.HttpOptions = HttpOptions
 	genai.types, genai.errors, google.genai = genai_types, genai_errors, genai
 	sys.modules.update({"google": google, "google.genai": genai, "google.genai.types": genai_types, "google.genai.errors": genai_errors})
 	return calls
@@ -195,6 +223,21 @@ class GeminiPathTests(TranslationBackendTestCase):
 		self.assertEqual(self.sleeps, [])
 		self.assertIn("免費額度", self.printed_text())
 
+	def test_gemini_timeout_skips_the_sentence_without_raising(self):
+		translator, calls = self.gemini_translator(lambda contents, n: TimeoutError("The read operation timed out"))
+		self.assertEqual(translator.translate_with_context("", "よろしく。"), "")
+		self.assertEqual(self.sleeps, [])
+		self.assertIn("沒有回應", self.printed_text())
+		self.assertEqual(calls.timeouts_ms, [int(self.app.GEMINI_LIVE_TIMEOUT_SEC * 1000)])
+
+	def test_live_captions_and_rebuild_use_their_own_timeouts(self):
+		translator, calls = self.gemini_translator(
+			lambda contents, n: "中文" if n == 1 else bilingual_reply(contents, "x")
+		)
+		translator.translate_with_context("", "よろしく。")
+		self.run_reconstruction(translator, ["日文です。"])
+		self.assertEqual(calls.timeouts_ms, [15000, 120000])
+
 	def test_gemini_echoing_japanese_is_retried_once_without_context(self):
 		source = "スタッフさんがペコリとしてくださっております"
 		translator, calls = self.gemini_translator(lambda contents, n: source if n == 1 else "工作人員向我們鞠躬了")
@@ -227,7 +270,9 @@ class GeminiPathTests(TranslationBackendTestCase):
 
 	def test_gemini_reconstruction_keeps_master_batches_retries_and_pacing(self):
 		lines = [f"日文{i}です。" for i in range(61)]
-		translator, calls = self.gemini_translator(lambda contents, n: "" if n == 1 else f"批次{n}")
+		translator, calls = self.gemini_translator(
+			lambda contents, n: "" if n == 1 else bilingual_reply(contents, f"批次{n}")
+		)
 		out_path, wav_path = self.run_reconstruction(translator, lines)
 		self.assertEqual([len(call["contents"].split("請處理這一批句子：\n", 1)[1].splitlines()) for call in calls], [60, 60, 1])
 		self.assertEqual(calls[0]["contents"], "請處理這一批句子：\n" + "\n".join(lines[:60]))
@@ -235,19 +280,52 @@ class GeminiPathTests(TranslationBackendTestCase):
 		self.assertEqual(self.sleeps, [20, 4.5])
 		text = out_path.read_text(encoding="utf-8")
 		self.assertIn("翻譯模型看過完整上下文潤過的版本", text)
-		self.assertTrue(text.endswith("批次2\n\n批次3\n"))
+		self.assertIn("日文59です。\n批次2譯文59", text)
+		self.assertTrue(text.endswith("日文60です。\n批次3譯文0\n"))
 		self.assertFalse(wav_path.exists())
 
 	def test_gemini_reconstruction_keeps_wav_when_a_batch_fails_all_retries(self):
 		lines = [f"日文{i}です。" for i in range(61)]
-		translator, calls = self.gemini_translator(lambda contents, n: "" if n <= 3 else f"批次{n}")
+		translator, calls = self.gemini_translator(
+			lambda contents, n: "" if n <= 3 else bilingual_reply(contents, f"批次{n}")
+		)
 		out_path, wav_path = self.run_reconstruction(translator, lines)
 		self.assertEqual(len(calls), 4)
 		text = out_path.read_text(encoding="utf-8")
 		self.assertIn("有 1 批整理失敗", text)
-		self.assertTrue(text.endswith("批次4\n"))
+		self.assertTrue(text.endswith("日文60です。\n批次4譯文0\n"))
 		self.assertTrue(wav_path.exists())
 		self.assertIn("已保留完整錄音", self.printed_text())
+
+	def test_gemini_reply_covering_only_half_the_batch_keeps_the_wav(self):
+		lines = [f"日文{i}です。" for i in range(20)]
+		translator, calls = self.gemini_translator(lambda contents, n: bilingual_reply(contents, "半", keep=10))
+		out_path, wav_path = self.run_reconstruction(translator, lines)
+		self.assertEqual(len(calls), 3)  # incomplete replies are retried like empty ones
+		self.assertEqual(self.sleeps, [20, 20, 20])
+		text = out_path.read_text(encoding="utf-8")
+		self.assertIn("有 1 批整理失敗", text)
+		self.assertIn("日文9です。\n半譯文9", text)  # the partial result is still kept in the transcript
+		self.assertTrue(wav_path.exists())
+
+	def test_gemini_reply_cut_off_by_the_output_limit_keeps_the_wav(self):
+		lines = [f"日文{i}です。" for i in range(4)]
+		translator, calls = self.gemini_translator(
+			lambda contents, n: (bilingual_reply(contents, "截"), types.SimpleNamespace(name="MAX_TOKENS"))
+		)
+		out_path, wav_path = self.run_reconstruction(translator, lines)
+		self.assertEqual(len(calls), 3)
+		self.assertIn("截斷", self.printed_text())
+		self.assertTrue(wav_path.exists())
+
+	def test_complete_gemini_reply_still_deletes_the_wav(self):
+		lines = [f"日文{i}です。" for i in range(4)]
+		translator, calls = self.gemini_translator(
+			lambda contents, n: (bilingual_reply(contents, "全"), types.SimpleNamespace(name="STOP"))
+		)
+		out_path, wav_path = self.run_reconstruction(translator, lines)
+		self.assertEqual(len(calls), 1)
+		self.assertFalse(wav_path.exists())
 
 
 
@@ -493,6 +571,60 @@ SESSION_ROWS = SOUND_ROWS[:3] + [
 ]
 
 
+class _FakeAudio:
+	"""Stands in for a numpy float array: numpy is stubbed in this test module."""
+
+	def __init__(self, samples):
+		self.samples = samples
+
+	def __mul__(self, _):
+		return self
+
+	def astype(self, _):
+		return self
+
+	def tobytes(self):
+		return b"\x00\x00" * self.samples
+
+
+class RecordingTests(TranslationBackendTestCase):
+	def make_capture(self, record_path):
+		capture = object.__new__(self.app.AudioCapture)  # skip PyAudio / VAD setup
+		capture._record_path = record_path
+		capture._wav_writer = None
+		capture._recording = False
+		capture._wav_lock = __import__("threading").Lock()
+		return capture
+
+	def test_stop_then_start_again_appends_instead_of_overwriting(self):
+		import wave
+		fake_np = types.SimpleNamespace(clip=lambda x, *_: x, int16="int16")
+		with tempfile.TemporaryDirectory() as temp_dir, mock.patch.object(self.app, "np", fake_np):
+			path = Path(temp_dir) / "transcript_audio.wav"
+			capture = self.make_capture(path)
+			self.assertTrue(capture.start_recording())
+			capture._write_recording(_FakeAudio(16000))
+			self.assertTrue(capture.stop_recording())
+			capture._write_recording(_FakeAudio(8000))  # not recording: must be skipped
+			self.assertTrue(capture.start_recording())
+			capture._write_recording(_FakeAudio(4000))
+			capture._close_recording()
+			with wave.open(str(path), "rb") as wav:
+				self.assertEqual(wav.getnframes(), 16000 + 4000)
+
+	def test_recording_flags(self):
+		with tempfile.TemporaryDirectory() as temp_dir:
+			capture = self.make_capture(Path(temp_dir) / "a.wav")
+			self.assertFalse(capture.stop_recording())
+			self.assertTrue(capture.start_recording())
+			self.assertFalse(capture.start_recording())
+			self.assertTrue(capture.is_recording())
+			capture.stop_recording()
+			self.assertFalse(capture.is_recording())
+			capture._close_recording()
+		self.assertFalse(self.make_capture(None).start_recording())
+
+
 class AudioRoutingTests(TranslationBackendTestCase):
 	def test_app_device_is_found_by_process_path_not_display_name(self):
 		self.assertEqual(self.app.get_app_output_device("brave.exe", SOUND_ROWS),
@@ -505,6 +637,33 @@ class AudioRoutingTests(TranslationBackendTestCase):
 		self.assertEqual(self.app.get_default_output_device(SOUND_ROWS), "FxSound Audio Enhancer\\Device\\喇叭\\Render")
 		self.assertEqual(self.app.find_output_device("CABLE Input", SOUND_ROWS), "VB-Audio Virtual Cable\\Device\\CABLE Input\\Render")
 		self.assertIsNone(self.app.find_output_device("不存在的裝置", SOUND_ROWS))
+
+	def test_restorer_switches_back_only_once(self):
+		self.patch_sound_volume_view()
+		with mock.patch.object(self.app, "set_app_output_device", return_value=True) as set_device:
+			restore = self.app.AudioRoutingRestorer("brave.exe", "Realtek(R) Audio\\Device\\耳機\\Render")
+			restore()
+			restore()  # finally + atexit + console handler may all fire
+		set_device.assert_called_once_with("brave.exe", "Realtek(R) Audio\\Device\\耳機\\Render")
+
+	def test_restorer_without_a_remembered_device_follows_the_system_default(self):
+		# goes through restore_app_output_device: back to "follow the system default", not pinned
+		self.patch_sound_volume_view()
+		with mock.patch.object(self.app, "set_app_output_device", return_value=True) as set_device:
+			self.app.AudioRoutingRestorer("brave.exe", None)()
+		set_device.assert_called_once_with("brave.exe", "DefaultRenderDevice")
+
+	def test_console_close_event_runs_the_restorer(self):
+		handlers = []
+		win32api = types.SimpleNamespace(SetConsoleCtrlHandler=lambda handler, add: handlers.append(handler))
+		win32con = types.SimpleNamespace(
+			CTRL_C_EVENT=0, CTRL_BREAK_EVENT=1, CTRL_CLOSE_EVENT=2, CTRL_LOGOFF_EVENT=5, CTRL_SHUTDOWN_EVENT=6,
+		)
+		callback = mock.Mock()
+		with mock.patch.dict(sys.modules, {"win32api": win32api, "win32con": win32con}):
+			self.app._install_console_close_handler(callback)
+		self.assertFalse(handlers[0](2))  # CTRL_CLOSE_EVENT: run it, but let Windows continue
+		callback.assert_called_once_with()
 
 	def test_inactive_session_listed_first_is_not_the_current_device(self):
 		self.assertEqual(self.app.get_app_output_device("firefox.exe", SESSION_ROWS),
@@ -626,6 +785,39 @@ class WorkflowWiringTests(TranslationBackendTestCase):
 				worker.join(timeout=5)
 		self.assertEqual(ja, "していく番組です")
 		self.assertEqual(zh, "這是會這樣做下去的節目。")
+
+	def test_worker_keeps_running_after_an_error_and_shows_a_warning(self):
+		import time
+		segment = FakeSegment(0, "よろしく")
+		segment.no_speech_prob = 0.1
+		segment.avg_logprob = -0.1
+		translator = mock.Mock()
+		translator.translate_with_context.return_value = "請多指教"
+		utterances, captions = queue.Queue(), queue.Queue()
+		with mock.patch.object(self.app, "load_glossary", return_value={}), \
+				tempfile.TemporaryDirectory() as temp_dir, \
+				mock.patch.object(self.app, "TRANSCRIPT_DIR", Path(temp_dir)), \
+				mock.patch("builtins.print") as printed:
+			worker = self.app.Worker(utterances, captions, queue.Queue(), translator=translator)
+			worker.asr = mock.Mock()
+			worker.asr.transcribe.side_effect = [
+				RuntimeError("Library cublas64_12.dll is not found or cannot be loaded"),
+				([segment], None),
+			]
+			worker.start()
+			utterances.put(([0.0] * 16000, time.time()))
+			utterances.put(([0.0] * 16000, time.time()))
+			try:
+				warning = captions.get(timeout=5)
+				caption = captions.get(timeout=5)
+			finally:
+				worker.stop()
+				worker.join(timeout=5)
+		self.assertFalse(worker.is_alive())
+		self.assertIn("失敗", warning[1])
+		self.assertIn("cuBLAS", warning[2])
+		self.assertEqual(caption[1:], ("よろしく", "請多指教"))
+		self.assertIn("cuBLAS", " ".join(str(c.args) for c in printed.call_args_list))
 
 
 

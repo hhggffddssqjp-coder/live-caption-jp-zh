@@ -86,6 +86,8 @@ live_caption_gemini.py
     任何聲音。這個小聲的背景音通常不會很干擾，習慣了就好。
 """
 
+import atexit
+import math
 import os
 import ntpath
 import sys
@@ -115,7 +117,9 @@ from PIL import Image, ImageTk
 
 from faster_whisper import WhisperModel
 from silero_vad import load_silero_vad, VADIterator
-from local_translation import LocalTranslationEngine, translation_problem
+from local_translation import (
+    LocalTranslationEngine, bilingual_pairs_acceptable, parse_bilingual_pairs, translation_problem,
+)
 from llama_server import LlamaServerError, ensure_llama_server
 
 # The Gemini SDK is imported only when the Gemini backend is chosen, so local-model
@@ -171,6 +175,27 @@ WHISPER_BEAM_SIZE = 5             # 用 beam search 選最佳辨識結果，GPU 
 # （給雙擊 exe 這種沒有終端機可以先設環境變數的用法）。兩種都不寫死在程式碼裡。
 GEMINI_MODEL = "gemini-3.5-flash-lite"
 GEMINI_API_KEY_FILE = Path(__file__).parent / "gemini_api_key.txt"
+
+
+def _env_seconds(name: str, default: float) -> float:
+    """讀取「秒數」環境變數；沒設、不是正數或不是有限數字時用預設值"""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        value = float("nan")
+    if not math.isfinite(value) or value <= 0:
+        print(f"環境變數 {name}={raw!r} 不是正數秒數，改用預設 {default:g} 秒。")
+        return default
+    return value
+
+
+# Gemini 單次請求的逾時。Worker 是單一執行緒依序辨識+翻譯，一個請求卡住，後面所有
+# 字幕都會跟著停住，所以即時字幕要短；事後整理一批 60 句，給比較長的時間
+GEMINI_LIVE_TIMEOUT_SEC = _env_seconds("GEMINI_LIVE_TIMEOUT", 15.0)
+GEMINI_BATCH_TIMEOUT_SEC = _env_seconds("GEMINI_BATCH_TIMEOUT", 120.0)
 
 # 翻譯引擎：gemini（預設，跟以前一樣）或 local（本機語言模型，見檔案開頭說明）。
 # 啟動畫面會記住上次的選擇；環境變數 TRANSLATION_BACKEND 可以指定預設值。
@@ -466,11 +491,26 @@ def _rebuild_user_prompt(batch: list[str], context_tail: str) -> str:
 	) + "請處理這一批句子：\n" + "\n".join(batch)
 
 
+def _gemini_reply_truncated(response) -> bool:
+    """Gemini 是不是因為輸出 token 上限才停下來（回覆被截斷、後面的句子不見了）"""
+    try:
+        reason = response.candidates[0].finish_reason
+    except (AttributeError, IndexError, TypeError):
+        return False
+    return "MAX_TOKENS" in str(getattr(reason, "name", reason)).upper()
+
+
 def _polish_with_gemini(
-    translator: "Translator", ja_lines: list[str], system_prompt: str
+    translator: "Translator", ja_lines: list[str], system_prompt: str, glossary: dict | None = None,
 ) -> tuple[list[str], int]:
-    """回傳 (整理好的段落, 重試 3 次仍失敗的批數)。失敗批數大於 0 時，呼叫端
-    要保留完整錄音，不然那幾批的內容就永遠找不回來了。"""
+    """回傳 (整理好的段落, 重試 3 次仍不完整的批數)。失敗批數大於 0 時，呼叫端
+    要保留完整錄音，不然那幾批的內容就永遠找不回來了。
+
+    以前只要回覆不是空字串就算成功；被輸出上限截斷、少了好幾句、或夾帶說明文字
+    的回覆也照收，錄音照刪。現在每一批都跟本機模型一樣，用 parse_bilingual_pairs +
+    bilingual_pairs_acceptable 檢查句數和翻譯；不合格就重試，重試完還是不合格，
+    就把最後一次的結果放進整理稿（總比整批空白好），但算成失敗、保留錄音。
+    """
     polished_parts = []
     failed_batches = 0
     context_tail = ""
@@ -482,19 +522,30 @@ def _polish_with_gemini(
         # 這裡跟即時字幕不一樣：這是背景整理工作，不趕時間，撞到免費額度限制
         # 的話等久一點重試，把它做完比做快更重要——所以不用 translator._chat
         # 那個「立刻放棄」的快速失敗邏輯，這裡自己重試
-        result = ""
+        result, complete = "", False
         for attempt in range(3):
-            result = translator._chat(system_prompt, user_prompt)
-            if result:
-                break
-            print(f"  第 {batch_no} 批翻譯失敗（可能撞到額度限制），20 秒後重試（第 {attempt + 1} 次）...")
+            reply, truncated = translator._chat_batch(system_prompt, user_prompt)
+            if reply:
+                result = reply
+                complete = not truncated and bilingual_pairs_acceptable(
+                    parse_bilingual_pairs(reply), batch, glossary
+                )
+                if complete:
+                    break
+                why = "回覆被輸出上限截斷" if truncated else "回覆的句數或格式不完整"
+            else:
+                why = "翻譯失敗（可能撞到額度限制）"
+            print(f"  第 {batch_no} 批{why}，20 秒後重試（第 {attempt + 1} 次）...")
             time.sleep(20)
 
         if result:
             polished_parts.append(result)
-        else:
+        if not complete:
             failed_batches += 1
-            print(f"  第 {batch_no} 批重試 3 次仍然失敗，這一批會從整理稿中缺漏")
+            if result:
+                print(f"  第 {batch_no} 批重試 3 次仍然不完整，先放進整理稿，但這一批可能有缺漏")
+            else:
+                print(f"  第 {batch_no} 批重試 3 次仍然失敗，這一批會從整理稿中缺漏")
         context_tail = "\n".join(batch[-2:])
         print(f"  已處理第 {batch_no}/{total_batches} 批")
 
@@ -584,7 +635,7 @@ def rebuild_transcript_from_full_audio(
             print(f"之後可以用這行指令重新處理：{_rebuild_command(wav_path)}")
             return None
     else:
-        polished_parts, failed_batches = _polish_with_gemini(translator, ja_lines, system_prompt)
+        polished_parts, failed_batches = _polish_with_gemini(translator, ja_lines, system_prompt, glossary)
 
     if not polished_parts:
         print(f"翻譯模型沒有回傳任何內容，略過這份整理稿，已保留完整錄音：{wav_path}")
@@ -794,6 +845,58 @@ def restore_app_output_device(process_name: str, original_device: str | None):
         print(f"已把 {process_name} 的輸出裝置切回「{original_device}」。")
     else:
         print(f"已把 {process_name} 的輸出裝置改回跟著系統預設的播放裝置。")
+
+
+class AudioRoutingRestorer:
+    """把來源程式（瀏覽器）的輸出裝置切回原本的，而且只會做一次。
+
+    同一個實例會掛在好幾個地方：main() 的 finally、atexit、主控台的關閉 / Ctrl+C 事件。
+    哪一個先觸發都可以，之後的呼叫什麼都不做，不會重複切換。切回哪個裝置交給
+    restore_app_output_device：查不到原本的裝置時，讓它改回跟著系統預設的播放裝置。
+    """
+
+    def __init__(self, process_name: str, original_device: str | None):
+        self.process_name = process_name
+        self.original_device = original_device
+        self._lock = threading.Lock()
+        self._done = False
+
+    def __call__(self) -> None:
+        with self._lock:
+            if self._done:
+                return
+            self._done = True
+        restore_app_output_device(self.process_name, self.original_device)
+
+
+def _install_console_close_handler(callback) -> None:
+    """主控台視窗被直接關掉、按 Ctrl+C、登出或關機時，先執行 callback。
+
+    直接關掉主控台時 Windows 會直接結束行程，finally 和 atexit 都不會跑；
+    這個事件處理器是唯一的機會（Windows 大約給 5 秒，夠呼叫 SoundVolumeView）。
+    回傳 False，讓 Ctrl+C 照常變成 KeyboardInterrupt。
+    """
+    try:
+        import win32api
+        import win32con
+    except ImportError:
+        return
+
+    def handler(ctrl_type):
+        if ctrl_type in (
+            win32con.CTRL_C_EVENT, win32con.CTRL_BREAK_EVENT, win32con.CTRL_CLOSE_EVENT,
+            win32con.CTRL_LOGOFF_EVENT, win32con.CTRL_SHUTDOWN_EVENT,
+        ):
+            try:
+                callback()
+            except Exception as e:
+                print(f"結束時切回音訊輸出失敗：{e}")
+        return False
+
+    try:
+        win32api.SetConsoleCtrlHandler(handler, True)
+    except Exception as e:
+        print(f"沒辦法攔截主控台關閉事件（直接關掉視窗時可能不會切回音訊輸出）：{e}")
 
 
 class PauseState:
@@ -1224,6 +1327,7 @@ class AudioCapture(threading.Thread):
         # 轉檔），事後重新辨識用途足夠，比存原始取樣率省很多硬碟空間
         self._record_path = record_path
         self._wav_writer = None
+        self._recording = False  # 「停止錄製」只是暫停寫入，檔案留著開，下次開始接著寫
         self._wav_lock = threading.Lock()
 
         print("載入語音活動偵測模型（Silero VAD，第一次執行會自動下載）...")
@@ -1238,31 +1342,50 @@ class AudioCapture(threading.Thread):
         self._stop = threading.Event()
 
     def start_recording(self) -> bool:
-        """手動開始錄製完整音訊；已經在錄、或沒有指定檔名的話回傳 False"""
+        """手動開始錄製完整音訊；已經在錄、或沒有指定檔名的話回傳 False。
+
+        只有第一次才開檔。以前每次開始都用 "wb" 重開同一個檔名，錄、停、再錄
+        就會把前一段整個清掉；現在多段錄音會依序接在同一個檔案裡。
+        """
         if self._record_path is None:
             return False
         with self._wav_lock:
-            if self._wav_writer is not None:
+            if self._recording:
                 return False
-            writer = wave.open(str(self._record_path), "wb")
-            writer.setnchannels(1)
-            writer.setsampwidth(2)  # int16
-            writer.setframerate(TARGET_SR)
-            self._wav_writer = writer
+            if self._wav_writer is None:
+                writer = wave.open(str(self._record_path), "wb")
+                writer.setnchannels(1)
+                writer.setsampwidth(2)  # int16
+                writer.setframerate(TARGET_SR)
+                self._wav_writer = writer
+            self._recording = True
         return True
 
     def stop_recording(self) -> bool:
-        """手動停止錄製；本來就沒在錄的話回傳 False"""
+        """手動停止錄製（暫停寫入，檔案在程式結束時才關閉）；本來就沒在錄的話回傳 False"""
         with self._wav_lock:
-            if self._wav_writer is None:
+            if not self._recording:
                 return False
-            self._wav_writer.close()
-            self._wav_writer = None
+            self._recording = False
         return True
 
     def is_recording(self) -> bool:
         with self._wav_lock:
-            return self._wav_writer is not None
+            return self._recording
+
+    def _write_recording(self, audio_16k) -> None:
+        """錄製中才把這一段 16kHz 單聲道音訊寫進 WAV"""
+        with self._wav_lock:
+            if self._recording and self._wav_writer is not None:
+                pcm16 = np.clip(audio_16k * 32767, -32768, 32767).astype(np.int16)
+                self._wav_writer.writeframes(pcm16.tobytes())
+
+    def _close_recording(self) -> None:
+        with self._wav_lock:
+            self._recording = False
+            if self._wav_writer is not None:
+                self._wav_writer.close()
+                self._wav_writer = None
 
     def _pick_loopback_device(self):
         if self._preferred_name:
@@ -1375,10 +1498,7 @@ class AudioCapture(threading.Thread):
 
             audio_16k = resample_linear(audio, self.stream_sr, TARGET_SR)
 
-            with self._wav_lock:
-                if self._wav_writer is not None:
-                    pcm16 = np.clip(audio_16k * 32767, -32768, 32767).astype(np.int16)
-                    self._wav_writer.writeframes(pcm16.tobytes())
+            self._write_recording(audio_16k)
 
             pending = np.concatenate([pending, audio_16k])
 
@@ -1421,10 +1541,7 @@ class AudioCapture(threading.Thread):
         stream.stop_stream()
         stream.close()
         self.pa.terminate()
-        with self._wav_lock:
-            if self._wav_writer is not None:
-                self._wav_writer.close()
-                self._wav_writer = None
+        self._close_recording()
 
 
 _SYSTEM_PROMPT_BASE = (
@@ -1539,9 +1656,12 @@ class Translator:
                 return lines[0]
         return None
 
-    def _chat(self, system_prompt: str, user_prompt: str) -> str:
+    def _chat(self, system_prompt: str, user_prompt: str, timeout_sec: float | None = None) -> str:
+        """送出一次翻譯請求。timeout_sec 只用在 Gemini：預設是即時字幕的
+        GEMINI_LIVE_TIMEOUT_SEC，事後整理傳 GEMINI_BATCH_TIMEOUT_SEC。逾時就跳過，回傳空字串。"""
         if self.backend == TRANSLATION_BACKEND_LOCAL:
             return self.local.live_chat(system_prompt, user_prompt)
+        timeout_sec = timeout_sec or GEMINI_LIVE_TIMEOUT_SEC
         # 這裡故意不做「撞到額度限制就睡幾秒重試」這件事——Worker 是單一執行緒
         # 依序處理每一句話，這裡卡多久，後面所有排隊中的字幕就跟著晚多久出現，
         # 睡眠等待幾秒鐘乘上好幾次重試，很容易就吃光延遲緩衝爭取來的時間，變成
@@ -1554,11 +1674,18 @@ class Translator:
                 config=genai_types.GenerateContentConfig(
                     system_instruction=system_prompt,
                     temperature=0.3,
+                    # 沒設的話 SDK 會一直等，一個卡住的請求就讓後面所有字幕停住（單位是毫秒）
+                    http_options=genai_types.HttpOptions(timeout=int(timeout_sec * 1000)),
                 ),
             )
+            self._last_reply_truncated = _gemini_reply_truncated(response)
             result = (response.text or "").strip()
             return _collapse_repetition(result)
         except Exception as e:
+            self._last_reply_truncated = False
+            if "timeout" in type(e).__name__.lower() or "timed out" in str(e).lower():
+                print(f"Gemini API 超過 {timeout_sec:g} 秒沒有回應，這句先跳過，下一句會繼續嘗試。")
+                return ""
             is_rate_limit = "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e)
             if is_rate_limit:
                 print("Gemini API 撞到免費額度限制，這句先跳過，下一句會繼續嘗試。")
@@ -1570,6 +1697,13 @@ class Translator:
                 # 這把金鑰目前實際能用的型號，不用回來猜、也不用等我查
                 self._print_available_models()
             return ""
+
+    def _chat_batch(self, system_prompt: str, user_prompt: str) -> tuple[str, bool]:
+        """事後整理用的 Gemini 請求：回傳 (回覆文字, 是否因為輸出上限被截斷)。
+        即時字幕不用這個，行為不變。"""
+        self._last_reply_truncated = False
+        text = self._chat(system_prompt, user_prompt, timeout_sec=GEMINI_BATCH_TIMEOUT_SEC)
+        return text, self._last_reply_truncated
 
     def _print_available_models(self):
         try:
@@ -1670,6 +1804,7 @@ class Worker(threading.Thread):
         self._stop.set()
 
     def run(self):
+        failures = 0  # 連續失敗幾句；成功一句就歸零
         while not self._stop.is_set():
             if self.pause_state is not None and self.pause_state.is_paused():
                 time.sleep(0.1)
@@ -1679,59 +1814,80 @@ class Worker(threading.Thread):
             except queue.Empty:
                 continue
 
-            segments, _ = self.asr.transcribe(
-                audio,
-                language="ja",
-                vad_filter=False,
-                beam_size=WHISPER_BEAM_SIZE,
-                condition_on_previous_text=False,  # 避免長時間播放時的重複幻覺
-                # Whisper 原生規則：「沒人說話機率 > 0.6」而且「平均信心 < -1.0」才當成
-                # 沒人講話丟掉。不要再自己加「no_speech_prob > 0.6 就整句丟」——large-v3
-                # 遇到背景音樂常給真正的人聲 0.6~0.9 的 no_speech_prob，實測 74 句裡有
-                # 13 句清楚的人聲被這樣誤丟（信心都在 -0.5 以上，turbo 也辨識出一樣的內容）
-                no_speech_threshold=0.6,
-                log_prob_threshold=-1.0,
-            )
-            segments = list(segments)
-            ja_text = "".join(seg.text for seg in segments).strip()
-            if not ja_text or ja_text in _HALLUCINATION_DENYLIST:
-                continue
+            # 任何一句出錯都不能讓這條執行緒結束：以前辨識或翻譯丟出例外（例如第一次
+            # 辨識就遇到 cublas64_12.dll 找不到），Worker 會無聲無息地停掉，畫面照播、
+            # 字幕卻再也不出現，使用者很難察覺
+            try:
+                self._process_utterance(audio, capture_time)
+                failures = 0
+            except Exception as e:
+                failures += 1
+                print(f"處理這一句時發生錯誤（第 {failures} 次連續失敗），先跳過：{type(e).__name__}: {e}")
+                hint = ""
+                if "cublas" in str(e).lower() or "cudnn" in str(e).lower():
+                    hint = "缺少 CUDA 函式庫，請照 README「安裝」第 1 步最後那段補上 cuBLAS"
+                    print(hint)
+                # 第一次失敗、之後每 10 次，在字幕列顯示一次，讓使用者知道字幕為什麼沒出來
+                if failures == 1 or failures % 10 == 0:
+                    self.caption_queue.put((
+                        time.time(), f"⚠ 辨識或翻譯失敗：{type(e).__name__}（詳見終端機）", hint,
+                    ))
 
-            # 除了固定的黑名單詞組，還要防「連續好幾句都一模一樣」這種一般性的
-            # 幻覺迴圈——不管卡住的是哪句話，只要連續重複就先濾掉，不要真的塞進
-            # queue 裡把畫面灌爆；等真的出現新內容，偵測會自動解除
-            self._recent_ja_texts.append(ja_text)
-            if (
-                len(self._recent_ja_texts) == self._recent_ja_texts.maxlen
-                and len(set(self._recent_ja_texts)) == 1
-            ):
-                if not self._hallucination_loop_warned:
-                    self._hallucination_loop_warned = True
-                    print(
-                        f"偵測到 Whisper 疑似卡進幻覺迴圈（連續辨識出同一句「{ja_text}」），"
-                        f"暫時濾掉不顯示；等真的出現新內容會自動恢復正常。"
-                    )
-                continue
-            self._hallucination_loop_warned = False
+    def _process_utterance(self, audio, capture_time: float) -> None:
+        """辨識 + 翻譯一句話，結果送進字幕列、逐字稿面板，並寫入逐字稿檔"""
+        segments, _ = self.asr.transcribe(
+            audio,
+            language="ja",
+            vad_filter=False,
+            beam_size=WHISPER_BEAM_SIZE,
+            condition_on_previous_text=False,  # 避免長時間播放時的重複幻覺
+            # Whisper 原生規則：「沒人說話機率 > 0.6」而且「平均信心 < -1.0」才當成
+            # 沒人講話丟掉。不要再自己加「no_speech_prob > 0.6 就整句丟」——large-v3
+            # 遇到背景音樂常給真正的人聲 0.6~0.9 的 no_speech_prob，實測 74 句裡有
+            # 13 句清楚的人聲被這樣誤丟（信心都在 -0.5 以上，turbo 也辨識出一樣的內容）
+            no_speech_threshold=0.6,
+            log_prob_threshold=-1.0,
+        )
+        segments = list(segments)
+        ja_text = "".join(seg.text for seg in segments).strip()
+        if not ja_text or ja_text in _HALLUCINATION_DENYLIST:
+            return
 
-            # 這句話該在幾點幾分顯示：開口的當下 + 延遲播放秒數，跟畫面/聲音用同一個延遲值，
-            # 三者才會對在一起。如果翻譯花的時間比這個還久，release_at 會排到過去，
-            # 視窗會直接顯示（不會反而更晚跳出）
-            release_at = capture_time + DISPLAY_DELAY_SEC
+        # 除了固定的黑名單詞組，還要防「連續好幾句都一模一樣」這種一般性的
+        # 幻覺迴圈——不管卡住的是哪句話，只要連續重複就先濾掉，不要真的塞進
+        # queue 裡把畫面灌爆；等真的出現新內容，偵測會自動解除
+        self._recent_ja_texts.append(ja_text)
+        if (
+            len(self._recent_ja_texts) == self._recent_ja_texts.maxlen
+            and len(set(self._recent_ja_texts)) == 1
+        ):
+            if not self._hallucination_loop_warned:
+                self._hallucination_loop_warned = True
+                print(
+                    f"偵測到 Whisper 疑似卡進幻覺迴圈（連續辨識出同一句「{ja_text}」），"
+                    f"暫時濾掉不顯示；等真的出現新內容會自動恢復正常。"
+                )
+            return
+        self._hallucination_loop_warned = False
 
-            # 看過前一句上下文，準確度比單句翻譯好，而且是逐句對齊的乾淨結果；
-            # 逐字稿面板、畫面下方字幕列都用同一份結果，不用多算一次
-            # （字幕列以前會把最近幾句接起來整段重翻，除了拖慢速度，塞太多字
-            # 也會把固定高度的字幕區撐爆，所以改成只顯示當下這一句就好）
-            zh_final = self.translator.translate_with_context(self.prev_ja, ja_text, self.glossary)
-            self.prev_ja = ja_text
-            self.transcript_queue.put((release_at, ja_text, zh_final))
-            self.caption_queue.put((release_at, ja_text, zh_final))
+        # 這句話該在幾點幾分顯示：開口的當下 + 延遲播放秒數，跟畫面/聲音用同一個延遲值，
+        # 三者才會對在一起。如果翻譯花的時間比這個還久，release_at 會排到過去，
+        # 視窗會直接顯示（不會反而更晚跳出）
+        release_at = capture_time + DISPLAY_DELAY_SEC
 
-            with open(self.log_path, "a", encoding="utf-8") as f:
-                ts = datetime.datetime.now().strftime("%H:%M:%S")
-                f.write(f"[{ts}] JP: {ja_text}\n")
-                f.write(f"[{ts}] ZH: {zh_final}\n\n")
+        # 看過前一句上下文，準確度比單句翻譯好，而且是逐句對齊的乾淨結果；
+        # 逐字稿面板、畫面下方字幕列都用同一份結果，不用多算一次
+        # （字幕列以前會把最近幾句接起來整段重翻，除了拖慢速度，塞太多字
+        # 也會把固定高度的字幕區撐爆，所以改成只顯示當下這一句就好）
+        zh_final = self.translator.translate_with_context(self.prev_ja, ja_text, self.glossary)
+        self.prev_ja = ja_text
+        self.transcript_queue.put((release_at, ja_text, zh_final))
+        self.caption_queue.put((release_at, ja_text, zh_final))
+
+        with open(self.log_path, "a", encoding="utf-8") as f:
+            ts = datetime.datetime.now().strftime("%H:%M:%S")
+            f.write(f"[{ts}] JP: {ja_text}\n")
+            f.write(f"[{ts}] ZH: {zh_final}\n\n")
 
 
 class PlayerWindow:
@@ -1836,7 +1992,7 @@ class PlayerWindow:
         if self.audio_capture.is_recording():
             self.audio_capture.stop_recording()
             self.record_btn.config(text="⏺ 開始錄製")
-            print("已停止錄製完整音訊。")
+            print("已暫停錄製完整音訊（再按一次會接著錄在同一個檔案裡）。")
         else:
             if self.audio_capture.start_recording():
                 self.record_btn.config(text="⏹ 停止錄製")
@@ -2058,6 +2214,12 @@ def main():
     except Exception as e:
         print(f"列出擷取來源失敗，使用系統預設：{e}")
         loopback_devices = []
+    # 系統目前的預設播放裝置（loopback 名稱），設定畫面用它判斷「系統預設」實際是哪個
+    # 裝置，檢查 ④⑤ 會不會形成回音迴圈
+    try:
+        default_output_name = _pa_probe.get_default_wasapi_loopback()["name"]
+    except Exception:
+        default_output_name = None
     _pa_probe.terminate()
     input_names = [INPUT_DEFAULT_LABEL] + [d["name"] for d in loopback_devices]
 
@@ -2097,6 +2259,7 @@ def main():
         default_input_index=index_of_name(input_names, last.get("input_device")),
         default_output_index=index_of_name(output_names, last.get("output_device")),
         default_model_index=TRANSLATION_BACKENDS.index(preferred_backend),
+        default_output_name=default_output_name,
     )
     if dialog is None:
         print("已取消。")
@@ -2147,36 +2310,9 @@ def main():
         print(f"翻譯引擎初始化失敗：{e}")
         sys.exit(1)
 
-    using_virtual_cable = bool(input_device and "CABLE" in input_device["name"].upper())
-    original_output_device = None
-    source_process_name = None
-
-    if using_virtual_cable:
-        try:
-            import psutil
-            source_process_name = psutil.Process(pid).name()
-        except Exception:
-            source_process_name = None
-
-        if source_process_name and SOUND_VOLUME_VIEW_PATH.exists():
-            sound_rows = _sound_volume_view_rows()
-            cable_device = find_output_device("CABLE Input", sound_rows) or "CABLE Input"
-            # 瀏覽器現在沒在播放聲音的話查不到（None），結束時就改回跟著系統預設的播放裝置
-            original_output_device = remember_app_output_device(source_process_name, cable_device, sound_rows)
-            if set_app_output_device(source_process_name, cable_device):
-                print(f"已自動把 {source_process_name} 的輸出裝置切到虛擬音訊線。")
-                print("提醒：切換裝置指令不會影響「已經在播放」的分頁——")
-                print("請去瀏覽器重新整理一次影片頁面（或暫停再重新播放），聲音才會真的改道過去，不然會抓到全程靜音、字幕不會跑出來。")
-            else:
-                print("自動切換輸出裝置失敗，可能需要自己在 Windows 音量混音器裡手動設定。")
-        else:
-            print("找不到 SoundVolumeView 或來源程式名稱，請自己在 Windows 音量混音器裡把")
-            print("瀏覽器輸出裝置設定成「CABLE Input」。")
-        print("使用虛擬音訊線擷取，不需要調低來源音量。")
-    # 不再自動調低來源音量了；沒用虛擬音訊線分開的話，背景音問題需要自己在
-    # Windows 音量混音器裡手動調整（見 duck_process_volume 函式，保留著沒刪，
-    # 之後想要的話可以自己在這裡重新呼叫）
-
+    # 先把會花很久、也可能失敗的東西都載入好（Silero VAD、Whisper 模型、音訊裝置），
+    # 最後才去切換瀏覽器的音訊輸出：以前是先切換再載入 Whisper，載入失敗或按 Ctrl+C
+    # 就不會走到 finally，瀏覽器會一直停在 CABLE
     buffer_seconds = DISPLAY_DELAY_SEC + BUFFER_MARGIN_SEC
     frame_buffer = FrameBuffer(max_seconds=buffer_seconds)
     # 用擷取裝置的原始取樣率存延遲緩衝，不要用 TARGET_SR（那是 16kHz，給 Whisper
@@ -2209,44 +2345,80 @@ def main():
     # 延遲聲音一定要從「不是被擷取來源」的裝置播出來，不然會變成回音疊加的無限循環
     audio_player = DelayedAudioPlayer(audio_ring, device=output_device, pause_state=pause_state)
 
-    screen_capture.start()
-    audio_capture.start()
-    audio_player.start()
-    worker.start()
+    using_virtual_cable = bool(input_device and "CABLE" in input_device["name"].upper())
+    original_output_device = None
+    source_process_name = None
+    restore_audio_routing = None
 
-    root = tk.Tk()
-    root.title(f"即時中日對照字幕 - {episode_title}" if episode_title else "即時中日對照字幕")
-    root.configure(bg="black")
-    root.minsize(640, 400)
+    if using_virtual_cable:
+        try:
+            import psutil
+            source_process_name = psutil.Process(pid).name()
+        except Exception:
+            source_process_name = None
 
-    # 合併成一個視窗：播放畫面（左）+ 逐字稿（右）用 PanedWindow 隔開，中間那條
-    # 分隔線可以直接拖曳調整兩邊比例，初始比例沿用原本兩個獨立視窗的大小分配
-    screen_w = root.winfo_screenwidth()
-    screen_h = root.winfo_screenheight()
-    transcript_w = min(520, screen_w // 3)
-    player_w = max(480, screen_w - transcript_w - 60)
-    root.geometry(f"{screen_w - 40}x{screen_h - 100}+20+20")
-
-    paned = tk.PanedWindow(
-        root, orient="horizontal", sashwidth=6, sashrelief="raised",
-        bg="#333333", showhandle=False,
-    )
-    left_frame = tk.Frame(paned, bg="black")
-    right_frame = tk.Frame(paned, bg="#111111")
-    paned.add(left_frame, minsize=320, width=player_w)
-    paned.add(right_frame, minsize=200, width=transcript_w)
-
-    # PlayerWindow 會先把控制按鈕列 pack 進 root 最上方，接著 paned 才 pack 進來
-    # 填滿剩下的空間，上下順序才會對（按鈕列要固定在最頂端，不會被分隔線蓋住）
-    PlayerWindow(
-        root, left_frame, frame_buffer, caption_queue, episode_title,
-        pause_state=pause_state, screen_capture=screen_capture, audio_capture=audio_capture,
-    )
-    paned.pack(fill="both", expand=True)
-
-    TranscriptWindow(right_frame, transcript_queue, episode_title)
+        if source_process_name and SOUND_VOLUME_VIEW_PATH.exists():
+            sound_rows = _sound_volume_view_rows()
+            cable_device = find_output_device("CABLE Input", sound_rows) or "CABLE Input"
+            # 瀏覽器現在沒在播放聲音的話查不到（None），結束時就改回跟著系統預設的播放裝置
+            original_output_device = remember_app_output_device(source_process_name, cable_device, sound_rows)
+            # 切換之前先準備好「只會執行一次」的還原，掛在 atexit 和主控台關閉事件上；
+            # 下面的 try/finally 也會呼叫它。哪個先觸發都可以，Brave 不會卡在 CABLE
+            restore_audio_routing = AudioRoutingRestorer(source_process_name, original_output_device)
+            atexit.register(restore_audio_routing)
+            _install_console_close_handler(restore_audio_routing)
+            if set_app_output_device(source_process_name, cable_device):
+                print(f"已自動把 {source_process_name} 的輸出裝置切到虛擬音訊線。")
+                print("提醒：切換裝置指令不會影響「已經在播放」的分頁——")
+                print("請去瀏覽器重新整理一次影片頁面（或暫停再重新播放），聲音才會真的改道過去，不然會抓到全程靜音、字幕不會跑出來。")
+            else:
+                print("自動切換輸出裝置失敗，可能需要自己在 Windows 音量混音器裡手動設定。")
+        else:
+            print("找不到 SoundVolumeView 或來源程式名稱，請自己在 Windows 音量混音器裡把")
+            print("瀏覽器輸出裝置設定成「CABLE Input」。")
+        print("使用虛擬音訊線擷取，不需要調低來源音量。")
+    # 不再自動調低來源音量了；沒用虛擬音訊線分開的話，背景音問題需要自己在
+    # Windows 音量混音器裡手動調整（見 duck_process_volume 函式，保留著沒刪，
+    # 之後想要的話可以自己在這裡重新呼叫）
 
     try:
+        screen_capture.start()
+        audio_capture.start()
+        audio_player.start()
+        worker.start()
+
+        root = tk.Tk()
+        root.title(f"即時中日對照字幕 - {episode_title}" if episode_title else "即時中日對照字幕")
+        root.configure(bg="black")
+        root.minsize(640, 400)
+
+        # 合併成一個視窗：播放畫面（左）+ 逐字稿（右）用 PanedWindow 隔開，中間那條
+        # 分隔線可以直接拖曳調整兩邊比例，初始比例沿用原本兩個獨立視窗的大小分配
+        screen_w = root.winfo_screenwidth()
+        screen_h = root.winfo_screenheight()
+        transcript_w = min(520, screen_w // 3)
+        player_w = max(480, screen_w - transcript_w - 60)
+        root.geometry(f"{screen_w - 40}x{screen_h - 100}+20+20")
+
+        paned = tk.PanedWindow(
+            root, orient="horizontal", sashwidth=6, sashrelief="raised",
+            bg="#333333", showhandle=False,
+        )
+        left_frame = tk.Frame(paned, bg="black")
+        right_frame = tk.Frame(paned, bg="#111111")
+        paned.add(left_frame, minsize=320, width=player_w)
+        paned.add(right_frame, minsize=200, width=transcript_w)
+
+        # PlayerWindow 會先把控制按鈕列 pack 進 root 最上方，接著 paned 才 pack 進來
+        # 填滿剩下的空間，上下順序才會對（按鈕列要固定在最頂端，不會被分隔線蓋住）
+        PlayerWindow(
+            root, left_frame, frame_buffer, caption_queue, episode_title,
+            pause_state=pause_state, screen_capture=screen_capture, audio_capture=audio_capture,
+        )
+        paned.pack(fill="both", expand=True)
+
+        TranscriptWindow(right_frame, transcript_queue, episode_title)
+
         root.mainloop()
     except KeyboardInterrupt:
         pass
@@ -2254,17 +2426,23 @@ def main():
         screen_capture.stop()
         audio_capture.stop()
         audio_player.stop()
-        if worker is not None:
-            worker.stop()
+        worker.stop()
 
-        if source_process_name:
-            # 結束時把來源程式的輸出裝置切回原本的，不留下要自己手動改回去的麻煩
+        # 結束時把來源程式的輸出裝置切回原本的（AudioRoutingRestorer 只會切一次）
+        if restore_audio_routing is not None:
+            restore_audio_routing()
+        elif source_process_name:
+            # 沒有 SoundVolumeView、沒辦法自動切換時，提醒使用者自己切回來
             restore_app_output_device(source_process_name, original_output_device)
 
-        worker.join(timeout=5)  # 等背景執行緒真的寫完檔案，再去讀來整理
+        # 等背景執行緒真的寫完檔案，再去讀來整理（中途出錯時執行緒可能根本還沒啟動，
+        # 對沒啟動過的執行緒呼叫 join() 會丟出例外，蓋掉原本的錯誤）
+        if worker.ident is not None:
+            worker.join(timeout=5)
         # 完整錄音的 WAV 檔要等 AudioCapture 執行緒真的跑完、把檔案關閉寫入磁碟，
         # 才能安全地拿去重新辨識——不然可能讀到還沒寫完、不完整的檔案
-        audio_capture.join(timeout=5)
+        if audio_capture.ident is not None:
+            audio_capture.join(timeout=5)
         print("已停止擷取，逐字稿已存檔。")
 
         try:

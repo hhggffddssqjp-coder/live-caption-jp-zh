@@ -73,6 +73,41 @@ def index_of_name(items: list[str], name: str | None, fallback: int = 0) -> int:
     return fallback
 
 
+LOOPBACK_SUFFIX = " [Loopback]"
+
+
+def physical_device_name(name: str | None) -> str:
+    """④ 的 loopback 名稱結尾多了「 [Loopback]」，去掉之後才能跟 ⑤ 的播放裝置名稱比對"""
+    name = (name or "").strip()
+    if name.endswith(LOOPBACK_SUFFIX):
+        name = name[: -len(LOOPBACK_SUFFIX)]
+    return name.strip()
+
+
+def audio_routing_warning(
+    input_name: str,
+    output_name: str,
+    input_is_default: bool,
+    output_is_default: bool,
+    default_output_name: str | None = None,
+) -> str:
+    """④（擷取哪個裝置的聲音）和 ⑤（延遲聲音播到哪）會不會形成回音迴圈；會的話回傳警告文字。
+
+    延遲聲音如果播到 ④ 正在錄的那個裝置，就會被再錄回去，每隔延遲秒數重播一次，
+    Whisper 也會重複辨識，變成無限迴圈。「系統預設」用 default_output_name（系統目前
+    的預設播放裝置）換算成實際裝置再比對。
+    """
+    captured = physical_device_name(default_output_name if input_is_default else input_name)
+    played = physical_device_name(default_output_name if output_is_default else output_name)
+    if input_is_default and output_is_default:
+        return "⚠ ④和⑤都選了系統預設：延遲聲音會被再錄回去，造成回音迴圈。請在⑤選另一個裝置（例如耳機）。"
+    if captured and played and captured == played:
+        return "⚠ ④和⑤是同一個裝置：延遲聲音會被再錄回去，造成回音迴圈。請在⑤選另一個裝置。"
+    if "CABLE" in played.upper():
+        return "⚠ ⑤選了虛擬音訊線：延遲聲音會被 CABLE 再錄回去，你也聽不到。請在⑤選耳機或喇叭。"
+    return ""
+
+
 def run_startup_dialog(
     window_titles: list[str],
     input_device_names: list[str],
@@ -85,11 +120,14 @@ def run_startup_dialog(
     default_input_index: int = 0,
     default_output_index: int = 0,
     default_model_index: int = 0,
+    default_output_name: str | None = None,
 ) -> dict | None:
     """顯示一個視窗，把原本要在終端機一個一個輸入的設定值都集中在這裡選。
 
     input_device_names / output_device_names 的第一個選項固定代表「系統預設」，
     呼叫端請自行在清單最前面塞一個「系統預設」的字串，選到索引 0 時自己視為 None。
+    default_output_name 是系統目前的預設播放裝置名稱，用來判斷「系統預設」實際是
+    哪個裝置，檢查 ④⑤ 會不會形成回音迴圈。
 
     回傳一個 dict：
         {
@@ -146,20 +184,24 @@ def run_startup_dialog(
     warn_label = tk.Label(outer, text="", font=FONT_SMALL, fg="#c0392b", anchor="w")
     warn_label.pack(fill="x")
 
-    def _refresh_warning(*_):
+    def _current_routing_warning() -> str:
         try:
-            in_name = input_device_names[input_listbox.curselection()[0]]
-            out_name = output_device_names[output_listbox.curselection()[0]]
+            in_idx = input_listbox.curselection()[0]
+            out_idx = output_listbox.curselection()[0]
         except IndexError:
-            warn_label.config(text="")
-            return
-        if in_name != "系統預設輸出裝置（無虛擬音源分離）" and in_name == out_name:
-            warn_label.config(text="⚠ ④跟⑤選了同一個裝置，會造成回音疊加，請選不同的輸出裝置。")
-        else:
-            warn_label.config(text="")
+            return ""
+        return audio_routing_warning(
+            input_device_names[in_idx], output_device_names[out_idx],
+            input_is_default=in_idx == 0, output_is_default=out_idx == 0,
+            default_output_name=default_output_name,
+        )
+
+    def _refresh_warning(*_):
+        warn_label.config(text=_current_routing_warning())
 
     input_listbox.bind("<<ListboxSelect>>", _refresh_warning)
     output_listbox.bind("<<ListboxSelect>>", _refresh_warning)
+    root.after(0, _refresh_warning)  # 一打開就檢查預設選項（第一次執行時 ④⑤ 都是系統預設）
 
     # ---- 翻譯模型（選用） ----
     model_listbox = None
@@ -180,6 +222,13 @@ def run_startup_dialog(
         except ValueError:
             warn_label.config(text="⚠ 延遲秒數請輸入數字。")
             return
+        routing_warning = _current_routing_warning()
+        if routing_warning:
+            from tkinter import messagebox
+            if not messagebox.askyesno(
+                "可能會有回音迴圈", routing_warning + "\n\n確定還是要用這個設定開始嗎？", parent=root,
+            ):
+                return
 
         result["window_index"] = window_listbox.curselection()[0]
         result["episode_title"] = title_entry.get().strip()
