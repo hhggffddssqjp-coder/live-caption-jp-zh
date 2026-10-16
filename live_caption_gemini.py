@@ -117,6 +117,7 @@ from PIL import Image, ImageTk
 
 from faster_whisper import WhisperModel
 from silero_vad import load_silero_vad, VADIterator
+from audio_timing import AudioRingBuffer, PlaybackDriftTracker  # 時間對齊的純邏輯，可以單獨測試
 from local_translation import (
     LocalTranslationEngine, bilingual_pairs_acceptable, parse_bilingual_pairs, translation_problem,
 )
@@ -388,7 +389,7 @@ def resample_high_quality(x: np.ndarray, orig_sr: int, target_sr: int) -> np.nda
         return x.astype(np.float32)
     g = gcd(orig_sr, target_sr)
     up, down = target_sr // g, orig_sr // g
-    return resample_poly(x, up, down).astype(np.float32)
+    return resample_poly(x, up, down, axis=0).astype(np.float32)  # axis=0：多聲道 (樣本, 聲道) 也能用
 
 
 _LOG_LINE_RE = re.compile(r"^\[(\d{2}):(\d{2}):(\d{2})\] (JP|ZH): (.*)$")
@@ -948,78 +949,6 @@ class FrameBuffer:
             return best
 
 
-class AudioRingBuffer:
-    """執行緒安全的音訊環形緩衝區：即時寫入音訊，播放時讀取「N 秒前」的位置"""
-
-    def __init__(self, sample_rate: int, max_seconds: float):
-        self.sample_rate = sample_rate
-        self.max_samples = max(1, int(sample_rate * max_seconds))
-        self.lock = threading.Lock()
-        self.buffer = np.zeros(self.max_samples, dtype=np.float32)
-        self.write_pos = 0
-        self.total_written = 0
-        self.start_time = time.time()
-
-    def write(self, samples: np.ndarray):
-        with self.lock:
-            n = len(samples)
-            if n == 0:
-                return
-
-            # 寫入位置永遠用「絕對樣本編號 % 緩衝區大小」計算，不能自己單獨累加 write_pos，
-            # 不然單次寫入量超過緩衝區容量時（理論上不會發生，但求穩固）位置會對不齊。
-            store = samples if n <= self.max_samples else samples[-self.max_samples:]
-            store_n = len(store)
-
-            self.total_written += n
-            store_start_abs = self.total_written - store_n
-            start_pos = store_start_abs % self.max_samples
-
-            end = start_pos + store_n
-            if end <= self.max_samples:
-                self.buffer[start_pos:end] = store
-            else:
-                first = self.max_samples - start_pos
-                self.buffer[start_pos:] = store[:first]
-                self.buffer[:end - self.max_samples] = store[first:]
-            self.write_pos = end % self.max_samples
-
-    def read_at(self, target_time: float, n: int) -> np.ndarray:
-        with self.lock:
-            elapsed = target_time - self.start_time
-            target_sample = int(elapsed * self.sample_rate)
-            available_start = max(0, self.total_written - self.max_samples)
-
-            if target_sample < available_start:
-                target_sample = available_start
-            if target_sample >= self.total_written:
-                return np.zeros(n, dtype=np.float32)
-
-            end_sample = min(target_sample + n, self.total_written)
-            count = end_sample - target_sample
-            start_pos = target_sample % self.max_samples
-
-            out = np.zeros(n, dtype=np.float32)
-            if start_pos + count <= self.max_samples:
-                out[:count] = self.buffer[start_pos:start_pos + count]
-            else:
-                first = self.max_samples - start_pos
-                out[:first] = self.buffer[start_pos:]
-                out[first:count] = self.buffer[:count - first]
-            return out
-
-    def latest_time(self) -> float:
-        """回傳「目前實際已經寫到哪個時間點」，給延遲播放器起算用。
-
-        不能直接用 time.time() 去反推，因為 AudioRingBuffer 建立的當下（在載入
-        Whisper/選裝置這些步驟之前）到真正開始寫入音訊之間，會有一段等待時間；
-        如果起算基準沒扣掉這段等待，播放器會永遠在跟一個不存在的未來時間點要
-        資料，導致緩衝區裡「有資料」但內容永遠是靜音，卻不會顯示任何錯誤。
-        """
-        with self.lock:
-            return self.start_time + self.total_written / self.sample_rate
-
-
 class ScreenCapture:
     """擷取指定視窗的畫面，存進 FrameBuffer 供延遲播放。
 
@@ -1142,12 +1071,22 @@ class ScreenCapture:
 class DelayedAudioPlayer:
     """把 AudioRingBuffer 裡「N 秒前」的聲音，即時播放到你選定的輸出裝置。
 
-    刻意把「取樣率轉換」這種比較耗運算的工作，丟給獨立的背景執行緒提前算好、
-    放進一個小緩衝區；真正即時播放用的 callback 只單純從緩衝區拿現成資料，
-    不做任何運算。這是因為 callback 是音訊播放的關鍵路徑，只要偶爾被其他
-    執行緒（例如畫面更新）卡住沒跑到，就會產生喀喀聲/雜訊；音訊播放不能有
-    任何延誤，所以把耗運算的部分挪出這個路徑之外。
+    刻意把讀取資料這種工作，丟給獨立的背景執行緒提前準備好、放進一個小緩衝區；
+    真正即時播放用的 callback 只單純從緩衝區拿現成資料，不做任何運算。callback
+    是音訊播放的關鍵路徑，只要偶爾被其他執行緒（例如畫面更新）卡住沒跑到，就會
+    產生喀喀聲/雜訊。
+
+    播放是立體聲（跟擷取到的聲道數一樣），而且直接用 AudioRingBuffer 的取樣率開
+    輸出串流、交給 Windows（WASAPI auto_convert）在需要時自己轉換。以前是轉成單聲道、
+    每 0.5 秒自己重取樣一次，每段的頭尾都有濾波器的接縫，聽起來會有規律的吱吱聲。
+    裝置不接受 auto_convert 時，才退回自己重取樣的舊做法。
+
+    另外每 5 秒用 PlaybackDriftTracker 比對一次「現在聽到的時間點」和「應該聽到的
+    時間點」，播放裝置的時鐘跟電腦時鐘有差，看長節目時才不會慢慢跟畫面錯開。
     """
+
+    TARGET_BUFFER_SEC = 4.0  # 背景執行緒預先準備好的量；撐得過被其他執行緒搶資源的空檔
+    CHUNK_SEC = 0.25
 
     def __init__(
         self, audio_ring: "AudioRingBuffer", device: int | None = None,
@@ -1160,24 +1099,25 @@ class DelayedAudioPlayer:
         self._feeder_stop = threading.Event()
         self._feeder_thread = None
         self._out_lock = threading.Lock()
-        self._out_chunks = deque()  # 已經轉換好取樣率、隨時可以播放的資料
+        self._out_chunks = deque()  # 已經準備好、隨時可以播放的資料，每塊形狀 (樣本, 聲道)
         self._out_available = 0     # _out_chunks 裡總共還有幾個樣本
+        self._drift = PlaybackDriftTracker()
+
+    def _resolve_device(self) -> int | None:
+        """沒指定裝置（系統預設）時，用 WASAPI 的預設輸出裝置——auto_convert 只有 WASAPI 有"""
+        if self.device is not None:
+            return self.device
+        try:
+            wasapi = next(h for h in sd.query_hostapis() if "WASAPI" in h["name"])
+            return wasapi["default_output_device"]
+        except Exception:
+            return None
 
     def start(self):
-        # 很多輸出裝置不支援 16kHz 這種非標準取樣率，改用裝置自己的預設取樣率開串流
-        device_index = self.device if self.device is not None else sd.default.device[1]
-        out_sr = int(sd.query_devices(device_index)["default_samplerate"])
-        if out_sr <= 0:
-            print(f"警告：輸出裝置回報的取樣率異常（{out_sr}），改用 48000 Hz。")
-            out_sr = 48000
-
-        print(f"延遲播放輸出取樣率：{out_sr} Hz")
-
-        self._feeder_thread = threading.Thread(
-            target=self._feeder_loop, args=(out_sr,), daemon=True
-        )
-        self._feeder_thread.start()
-
+        device_index = self._resolve_device()
+        info = sd.query_devices(device_index if device_index is not None else sd.default.device[1])
+        ring_sr = self.audio_ring.sample_rate
+        out_channels = max(1, min(self.audio_ring.channels, int(info["max_output_channels"]) or 1))
         status_error_count = {"n": 0}
         underrun_count = {"n": 0}
 
@@ -1189,7 +1129,7 @@ class DelayedAudioPlayer:
                 if status_error_count["n"] == 1 or status_error_count["n"] % 50 == 0:
                     print(f"延遲播放輸出串流回報異常（已發生 {status_error_count['n']} 次）：{status}")
             with self._out_lock:
-                out = np.zeros(frames, dtype=np.float32)
+                out = np.zeros((frames, out_channels), dtype=np.float32)
                 filled = 0
                 while filled < frames and self._out_chunks:
                     chunk = self._out_chunks[0]
@@ -1201,7 +1141,7 @@ class DelayedAudioPlayer:
                     else:
                         self._out_chunks[0] = chunk[take:]
                     self._out_available -= take
-                outdata[:, 0] = out
+                outdata[:] = out
 
             if filled < frames:
                 # 緩衝區被掏空、補不出足夠的資料，只能吐部分靜音——這就是「有訊息
@@ -1210,32 +1150,39 @@ class DelayedAudioPlayer:
                 if underrun_count["n"] == 1 or underrun_count["n"] % 100 == 0:
                     print(f"延遲播放緩衝區來不及補資料（已發生 {underrun_count['n']} 次），畫面可能因此聽起來沒聲音或斷斷續續。")
 
-        self._stream = sd.OutputStream(
-            samplerate=out_sr, channels=1, dtype="float32",
-            blocksize=1024, latency="high", callback=callback, device=self.device,
+        common = dict(
+            channels=out_channels, dtype="float32", blocksize=1024, latency="high",
+            callback=callback, device=device_index,
         )
+        try:
+            # 首選：用 ring 自己的取樣率開串流，需要轉換時交給 Windows 的音訊引擎（連續處理、沒有接縫）
+            self._stream = sd.OutputStream(
+                samplerate=ring_sr, extra_settings=sd.WasapiSettings(auto_convert=True), **common,
+            )
+            out_sr = ring_sr
+        except Exception as e:
+            # 退回舊做法：用裝置自己的取樣率，背景執行緒自己重取樣
+            out_sr = int(info["default_samplerate"]) or 48000
+            print(f"輸出裝置不接受自動轉換取樣率（{e}），改用 {out_sr} Hz 自己轉換。")
+            self._stream = sd.OutputStream(samplerate=out_sr, **common)
+
+        print(f"延遲播放輸出：{out_sr} Hz，{out_channels} 聲道"
+              + ("（不需要轉換取樣率）" if out_sr == ring_sr else "（自己轉換取樣率）"))
+
+        self._feeder_thread = threading.Thread(
+            target=self._feeder_loop, args=(out_sr, out_channels), daemon=True
+        )
+        self._feeder_thread.start()
         self._stream.start()
 
-    def _feeder_loop(self, out_sr: int):
-        # audio_ring 現在存的是「擷取裝置原始取樣率」的音訊（不是給 Whisper 用的
-        # 16kHz 版本），播放品質才不會被 Whisper 需要的低取樣率拖累——這裡要用
-        # ring 自己記錄的取樣率，不能再假設是 TARGET_SR
+    def _feeder_loop(self, out_sr: int, out_channels: int):
         ring_sr = self.audio_ring.sample_rate
-
-        # 每次重取樣的份量拉大一點：resample_poly 這類濾波器在每一小段的頭尾都會有
-        # 一點邊界效應，段落切得越細、接縫越多，聽起來就會變成連續的「吱吱聲」；
-        # 段落拉大到 0.5 秒，接縫次數降到 1/10，這個雜音應該會明顯改善
-        chunk_samples_in = max(1, int(0.5 * ring_sr))
-        # 拉大一點緩衝目標：真正執行時這條背景執行緒要跟畫面擷取/Whisper/翻譯
-        # 一起搶執行資源，比單獨測試時容易被排擠、來不及補資料，緩衝大一點
-        # 才有本錢撐過這種被搶資源的空檔，不然 callback 只能吐靜音。改用原始
-        # 取樣率存音訊之後，每次重取樣要處理的資料量比之前的 16kHz 版本多了
-        # 2~3 倍，這條執行緒更容易跟不上，緩衝空間也跟著拉大一點做為緩衝。
-        target_buffer_sec = 4.0
-        # 用 audio_ring 實際「寫到哪裡了」當基準，不能直接用 time.time()：
-        # 建立緩衝區到真正開始寫音訊之間，中間隔了載入模型、選裝置這些步驟的
-        # 等待時間，用 wall clock 反推會一直對到一個永遠不會有資料的未來時間點
+        # 不用重取樣時，段落大小只影響漂移校正的反應速度；自己重取樣時段落拉大一點，
+        # resample_poly 每段頭尾的接縫才不會太密集
+        chunk_samples_in = max(1, int((self.CHUNK_SEC if out_sr == ring_sr else 0.5) * ring_sr))
+        # 用 audio_ring 實際「寫到哪裡了」當基準：時間軸對齊牆上時鐘之後，這就是「現在」
         next_read_time = self.audio_ring.latest_time() - DISPLAY_DELAY_SEC
+        self._drift.reset()
 
         error_count = 0
         first_chunk_logged = False
@@ -1248,26 +1195,40 @@ class DelayedAudioPlayer:
                     time.sleep(0.05)
                     continue
                 if was_paused:
-                    # 剛從暫停恢復：讀取位置要重新對齊「現在」，不然會一直對到
-                    # 暫停期間那段沒有任何音訊被寫進來的空白，永遠補不上進度
+                    # 剛從暫停恢復：讀取位置要重新對齊「現在」，漂移校正也重新量基準
                     next_read_time = self.audio_ring.latest_time() - DISPLAY_DELAY_SEC
+                    self._drift.reset()
                     was_paused = False
 
                 with self._out_lock:
                     buffered_sec = self._out_available / out_sr if out_sr else 0
-                if buffered_sec >= target_buffer_sec:
+                if buffered_sec >= self.TARGET_BUFFER_SEC:
+                    # 緩衝區滿了、播放狀態穩定：這時才量漂移。現在耳朵聽到的，是
+                    # 「下一段要讀的位置」往回扣掉緩衝區裡還沒播出去的量
+                    fix = self._drift.correction(
+                        next_read_time - buffered_sec, time.time(), DISPLAY_DELAY_SEC
+                    )
+                    if fix:
+                        next_read_time += fix
+                        print(f"延遲播放的聲音和畫面差了 {abs(fix) * 1000:.0f} 毫秒，已"
+                              f"{'往前跳' if fix > 0 else '往回退'}重新對齊。")
                     time.sleep(0.01)
                     continue
 
                 samples = self.audio_ring.read_at(next_read_time, chunk_samples_in)
                 next_read_time += chunk_samples_in / ring_sr
-                # 這段是真的要播給你聽的，用高品質重取樣，不要用 resample_linear
-                # （那個給 Whisper 辨識用可以，人耳朵聽得出差別）
-                resampled = resample_high_quality(samples, ring_sr, out_sr)
+                if samples.shape[1] != out_channels:
+                    if out_channels == 1:
+                        samples = samples.mean(axis=1, keepdims=True)
+                    else:
+                        samples = samples[:, :out_channels]
+                if out_sr != ring_sr:
+                    # 這段是真的要播給你聽的，用高品質重取樣，不要用 resample_linear
+                    samples = resample_high_quality(samples, ring_sr, out_sr)
 
                 with self._out_lock:
-                    self._out_chunks.append(resampled)
-                    self._out_available += len(resampled)
+                    self._out_chunks.append(samples)
+                    self._out_available += len(samples)
 
                 if not first_chunk_logged:
                     first_chunk_logged = True
@@ -1387,21 +1348,29 @@ class AudioCapture(threading.Thread):
                 self._wav_writer.close()
                 self._wav_writer = None
 
-    def _pick_loopback_device(self):
+    def _pick_loopback_device(self, allow_default: bool = True):
+        """找擷取用的 loopback 裝置：有指定名稱就找同一個；找不到時，allow_default=True
+        才退回系統預設 loopback，否則回傳 None（讓呼叫端繼續重試同一個裝置）。
+
+        串流斷線重連時用 allow_default=False：以前會退回系統預設，原本用 CABLE 分開的
+        聲音就變成錄「你正在聽的那個裝置」，延遲聲音被再錄回去，形成回音迴圈。
+        以前找不到時會 sys.exit(1)；在背景執行緒裡 SystemExit 不會被 except Exception
+        接住，音訊執行緒就無聲無息地結束了，現在改成丟出 RuntimeError。
+        """
         if self._preferred_name:
             try:
                 for d in self.pa.get_loopback_device_info_generator():
                     if d["name"] == self._preferred_name:
                         return d
             except Exception:
-                pass  # 找不到就繼續往下退回系統預設
+                pass
+            if not allow_default:
+                return None
 
         try:
-            device = self.pa.get_default_wasapi_loopback()
-        except OSError:
-            print("找不到預設輸出裝置的 loopback，請確認 Windows 音效輸出裝置正常運作。")
-            sys.exit(1)
-        return device
+            return self.pa.get_default_wasapi_loopback()
+        except OSError as e:
+            raise RuntimeError("找不到預設輸出裝置的 loopback，請確認 Windows 音效輸出裝置正常運作。") from e
 
     def _open_stream(self, block_frames: int):
         return self.pa.open(
@@ -1432,9 +1401,18 @@ class AudioCapture(threading.Thread):
         print(f"開始擷取系統音訊：{self.device['name']} ({self.stream_sr} Hz, {self.channels} ch)")
         print("請在瀏覽器播放影片... (Ctrl+C 或關閉視窗可結束)")
 
+        ring_sr = self.audio_ring.sample_rate if self.audio_ring is not None else self.stream_sr
+        device_missing_warned = False
+
         while not self._stop.is_set():
             try:
+                read_started = time.perf_counter()
                 data = stream.read(block_frames, exception_on_overflow=False)
+                # 讀取有真的等到資料進來（花了大約一個區塊的時間），代表是「即時」讀到的，
+                # 這時的 time.time() 才能當作這批樣本錄完的時間，拿去對齊時鐘；
+                # 瞬間就回來表示是在追之前卡住時累積的資料，時間不準，不拿來對齊
+                block_sec = block_frames / self.stream_sr
+                captured_end = time.time() if time.perf_counter() - read_started >= 0.5 * block_sec else None
                 consecutive_errors = 0
             except Exception as e:
                 consecutive_errors += 1
@@ -1457,15 +1435,26 @@ class AudioCapture(threading.Thread):
                     break
 
                 try:
-                    self.device = self._pick_loopback_device()
+                    # 只找原本那個裝置，不退回系統預設（不然會變成回音迴圈）
+                    device = self._pick_loopback_device(allow_default=False)
+                    if device is None:
+                        if not device_missing_warned:
+                            device_missing_warned = True
+                            print(f"找不到原本的擷取裝置「{self._preferred_name}」，會繼續重試同一個裝置"
+                                  "（例如虛擬音訊線被移除或停用了，請到 Windows 音效設定確認）。")
+                        continue
+                    self.device = device
                     self.stream_sr = int(self.device["defaultSampleRate"])
                     self.channels = self.device["maxInputChannels"]
                     block_frames = max(1, int(self.stream_sr * VAD_CHUNK_SAMPLES / TARGET_SR))
                     stream = self._open_stream(block_frames)
                     print(f"音訊串流已重新開啟：{self.device['name']} ({self.stream_sr} Hz, {self.channels} ch)")
+                    if self.stream_sr != ring_sr:
+                        print(f"重新開啟後取樣率變成 {self.stream_sr} Hz，會先轉換成 {ring_sr} Hz 再延遲播放。")
                     consecutive_errors = 0
+                    device_missing_warned = False
                 except Exception:
-                    pass  # 開不成就等下一輪迴圈再試一次
+                    pass  # 開不成就等下一輪迴圈再試一次；中間缺的聲音，時鐘對齊會補成靜音
                 continue
 
             if self.pause_state is not None and self.pause_state.is_paused():
@@ -1483,18 +1472,27 @@ class AudioCapture(threading.Thread):
                         pass
                     was_paused = True
                 continue  # 音訊還是要讀掉避免緩衝區溢位，但暫停中不寫進任何緩衝區
+            if was_paused and self.audio_ring is not None:
+                # 剛從暫停恢復：延遲播放的時間軸直接接上「現在」，不把暫停的這段補成靜音
+                # （維持原本的暫停行為；暫停時畫面、聲音、字幕的同步另外處理）
+                self.audio_ring.rebase_clock()
+                captured_end = None
             was_paused = False
 
-            audio = np.frombuffer(data, dtype=np.float32)
-            if self.channels > 1:
-                audio = audio.reshape(-1, self.channels).mean(axis=1)
+            frames = np.frombuffer(data, dtype=np.float32).reshape(-1, max(1, self.channels))
+            # 給 Whisper / VAD / 錄音的是單聲道；給延遲播放的保留原本的聲道數（立體聲）
+            audio = frames.mean(axis=1) if frames.shape[1] > 1 else frames[:, 0]
 
             if self.audio_ring is not None:
                 # 存原始擷取取樣率的音訊給延遲播放用，不要存降到 16kHz 之後的版本——
                 # resample_linear 是單純線性內插、沒有做降頻前該有的抗鋸齒濾波，
-                # 拿去餵 Whisper 沒差，但直接播給人聽會多一層可聽見的雜訊/悶悶的感覺，
-                # 之後又要再重取樣回輸出裝置的取樣率，等於兩次有損轉換疊在一起。
-                self.audio_ring.write(audio)
+                # 拿去餵 Whisper 沒差，但直接播給人聽會多一層可聽見的雜訊/悶悶的感覺。
+                ring_frames = frames
+                if self.stream_sr != ring_sr:
+                    # 重連後取樣率變了（很少見）：先轉成緩衝區原本的取樣率，不然聲音速度和音高會錯
+                    ring_frames = resample_high_quality(frames, self.stream_sr, ring_sr)
+                    captured_end = None
+                self.audio_ring.write(ring_frames, captured_end=captured_end)
 
             audio_16k = resample_linear(audio, self.stream_sr, TARGET_SR)
 
@@ -2318,7 +2316,9 @@ def main():
     # 用擷取裝置的原始取樣率存延遲緩衝，不要用 TARGET_SR（那是 16kHz，給 Whisper
     # 用的降頻版本）——不然延遲播放出來的聲音品質會被拖到跟語音辨識輸入一樣低
     native_sr = int(input_device["defaultSampleRate"])
-    audio_ring = AudioRingBuffer(sample_rate=native_sr, max_seconds=buffer_seconds)
+    # 保留立體聲給延遲播放（多於 2 聲道的裝置只取前兩個聲道：左、右）
+    ring_channels = max(1, min(2, int(input_device.get("maxInputChannels", 1) or 1)))
+    audio_ring = AudioRingBuffer(sample_rate=native_sr, max_seconds=buffer_seconds, channels=ring_channels)
 
     utterance_queue: "queue.Queue" = queue.Queue()
     caption_queue: "queue.Queue" = queue.Queue()
