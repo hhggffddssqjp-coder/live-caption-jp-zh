@@ -28,7 +28,8 @@
    pip install -r requirements.txt
    ```
 2. **準備 Gemini API 金鑰**：到 https://aistudio.google.com/apikey 申請，把金鑰貼進程式資料夾的 `gemini_api_key.txt`
-3. **安裝虛擬音訊線和 SoundVolumeView**（見「安裝」第 4 步）。這一步可以不裝，但不裝的話會錄到電腦上所有聲音
+3. **安裝虛擬音訊線和 SoundVolumeView**（見「安裝」第 4 步）。不裝的話會錄到電腦上所有聲音；
+   而且延遲聲音要播到**另一個**裝置（例如耳機），不然會被再錄回去，形成回音迴圈（設定畫面會提醒）
 4. **執行**
    ```bash
    python live_caption_gemini.py

@@ -1997,6 +1997,12 @@ def main():
     except Exception as e:
         print(f"列出擷取來源失敗，使用系統預設：{e}")
         loopback_devices = []
+    # 系統目前的預設播放裝置（loopback 名稱），設定畫面用它判斷「系統預設」實際是哪個
+    # 裝置，檢查 ④⑤ 會不會形成回音迴圈
+    try:
+        default_output_name = _pa_probe.get_default_wasapi_loopback()["name"]
+    except Exception:
+        default_output_name = None
     _pa_probe.terminate()
     input_names = [INPUT_DEFAULT_LABEL] + [d["name"] for d in loopback_devices]
 
@@ -2036,6 +2042,7 @@ def main():
         default_input_index=index_of_name(input_names, last.get("input_device")),
         default_output_index=index_of_name(output_names, last.get("output_device")),
         default_model_index=TRANSLATION_BACKENDS.index(preferred_backend),
+        default_output_name=default_output_name,
     )
     if dialog is None:
         print("已取消。")
