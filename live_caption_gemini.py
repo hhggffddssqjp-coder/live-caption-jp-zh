@@ -86,6 +86,7 @@ live_caption_gemini.py
     任何聲音。這個小聲的背景音通常不會很干擾，習慣了就好。
 """
 
+import math
 import os
 import sys
 import re
@@ -170,6 +171,27 @@ WHISPER_BEAM_SIZE = 5             # 用 beam search 選最佳辨識結果，GPU 
 # （給雙擊 exe 這種沒有終端機可以先設環境變數的用法）。兩種都不寫死在程式碼裡。
 GEMINI_MODEL = "gemini-3.5-flash-lite"
 GEMINI_API_KEY_FILE = Path(__file__).parent / "gemini_api_key.txt"
+
+
+def _env_seconds(name: str, default: float) -> float:
+    """讀取「秒數」環境變數；沒設、不是正數或不是有限數字時用預設值"""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        value = float("nan")
+    if not math.isfinite(value) or value <= 0:
+        print(f"環境變數 {name}={raw!r} 不是正數秒數，改用預設 {default:g} 秒。")
+        return default
+    return value
+
+
+# Gemini 單次請求的逾時。Worker 是單一執行緒依序辨識+翻譯，一個請求卡住，後面所有
+# 字幕都會跟著停住，所以即時字幕要短；事後整理一批 60 句，給比較長的時間
+GEMINI_LIVE_TIMEOUT_SEC = _env_seconds("GEMINI_LIVE_TIMEOUT", 15.0)
+GEMINI_BATCH_TIMEOUT_SEC = _env_seconds("GEMINI_BATCH_TIMEOUT", 120.0)
 
 # 翻譯引擎：gemini（預設，跟以前一樣）或 local（本機語言模型，見檔案開頭說明）。
 # 啟動畫面會記住上次的選擇；環境變數 TRANSLATION_BACKEND 可以指定預設值。
@@ -465,7 +487,7 @@ def _polish_with_gemini(
         # 那個「立刻放棄」的快速失敗邏輯，這裡自己重試
         result = ""
         for attempt in range(3):
-            result = translator._chat(system_prompt, user_prompt)
+            result = translator._chat(system_prompt, user_prompt, timeout_sec=GEMINI_BATCH_TIMEOUT_SEC)
             if result:
                 break
             print(f"  第 {batch_no} 批翻譯失敗（可能撞到額度限制），20 秒後重試（第 {attempt + 1} 次）...")
@@ -1492,9 +1514,12 @@ class Translator:
                 return lines[0]
         return None
 
-    def _chat(self, system_prompt: str, user_prompt: str) -> str:
+    def _chat(self, system_prompt: str, user_prompt: str, timeout_sec: float | None = None) -> str:
+        """送出一次翻譯請求。timeout_sec 只用在 Gemini：預設是即時字幕的
+        GEMINI_LIVE_TIMEOUT_SEC，事後整理傳 GEMINI_BATCH_TIMEOUT_SEC。逾時就跳過，回傳空字串。"""
         if self.backend == TRANSLATION_BACKEND_LOCAL:
             return self.local.live_chat(system_prompt, user_prompt)
+        timeout_sec = timeout_sec or GEMINI_LIVE_TIMEOUT_SEC
         # 這裡故意不做「撞到額度限制就睡幾秒重試」這件事——Worker 是單一執行緒
         # 依序處理每一句話，這裡卡多久，後面所有排隊中的字幕就跟著晚多久出現，
         # 睡眠等待幾秒鐘乘上好幾次重試，很容易就吃光延遲緩衝爭取來的時間，變成
@@ -1507,11 +1532,16 @@ class Translator:
                 config=genai_types.GenerateContentConfig(
                     system_instruction=system_prompt,
                     temperature=0.3,
+                    # 沒設的話 SDK 會一直等，一個卡住的請求就讓後面所有字幕停住（單位是毫秒）
+                    http_options=genai_types.HttpOptions(timeout=int(timeout_sec * 1000)),
                 ),
             )
             result = (response.text or "").strip()
             return _collapse_repetition(result)
         except Exception as e:
+            if "timeout" in type(e).__name__.lower() or "timed out" in str(e).lower():
+                print(f"Gemini API 超過 {timeout_sec:g} 秒沒有回應，這句先跳過，下一句會繼續嘗試。")
+                return ""
             is_rate_limit = "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e)
             if is_rate_limit:
                 print("Gemini API 撞到免費額度限制，這句先跳過，下一句會繼續嘗試。")

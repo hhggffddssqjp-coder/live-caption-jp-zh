@@ -48,9 +48,22 @@ class ScriptedClient:
 		return reply
 
 
+class _GeminiCalls(list):
+	"""generate_content calls; per-request timeouts are kept apart in .timeouts_ms so the
+	exact-match assertions on prompts and parameters stay unchanged."""
+
+	def __init__(self):
+		super().__init__()
+		self.timeouts_ms = []
+
+
 def install_fake_gemini(reply):
 	"""Install a google.genai stand-in; returns the list of generate_content calls."""
-	calls = []
+	calls = _GeminiCalls()
+
+	class HttpOptions:
+		def __init__(self, timeout=None):
+			self.timeout = timeout
 
 	class GenerateContentConfig:
 		def __init__(self, **kwargs):
@@ -58,7 +71,10 @@ def install_fake_gemini(reply):
 
 	class Models:
 		def generate_content(self, model, contents, config):
-			calls.append({"model": model, "contents": contents, **config.kwargs})
+			kwargs = dict(config.kwargs)
+			http_options = kwargs.pop("http_options", None)
+			calls.timeouts_ms.append(getattr(http_options, "timeout", None))
+			calls.append({"model": model, "contents": contents, **kwargs})
 			result = reply(contents, len(calls))
 			if isinstance(result, BaseException):
 				raise result
@@ -78,6 +94,7 @@ def install_fake_gemini(reply):
 	genai_errors = types.ModuleType("google.genai.errors")
 	genai.Client = Client
 	genai_types.GenerateContentConfig = GenerateContentConfig
+	genai_types.HttpOptions = HttpOptions
 	genai.types, genai.errors, google.genai = genai_types, genai_errors, genai
 	sys.modules.update({"google": google, "google.genai": genai, "google.genai.types": genai_types, "google.genai.errors": genai_errors})
 	return calls
@@ -194,6 +211,19 @@ class GeminiPathTests(TranslationBackendTestCase):
 		self.assertEqual(translator.translate_with_context("", "よろしく。"), "")
 		self.assertEqual(self.sleeps, [])
 		self.assertIn("免費額度", self.printed_text())
+
+	def test_gemini_timeout_skips_the_sentence_without_raising(self):
+		translator, calls = self.gemini_translator(lambda contents, n: TimeoutError("The read operation timed out"))
+		self.assertEqual(translator.translate_with_context("", "よろしく。"), "")
+		self.assertEqual(self.sleeps, [])
+		self.assertIn("沒有回應", self.printed_text())
+		self.assertEqual(calls.timeouts_ms, [int(self.app.GEMINI_LIVE_TIMEOUT_SEC * 1000)])
+
+	def test_live_captions_and_rebuild_use_their_own_timeouts(self):
+		translator, calls = self.gemini_translator(lambda contents, n: "中文")
+		translator.translate_with_context("", "よろしく。")
+		self.run_reconstruction(translator, ["日文です。"])
+		self.assertEqual(calls.timeouts_ms, [15000, 120000])
 
 	def test_gemini_echoing_japanese_is_retried_once_without_context(self):
 		source = "スタッフさんがペコリとしてくださっております"
