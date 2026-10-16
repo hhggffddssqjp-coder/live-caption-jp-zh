@@ -7,6 +7,7 @@ env vars it inherits so the built argv (``server.command``) stays exactly what p
 builds. Row 8 (config precedence) and row 10 (server_args parsing) are pure-function tests.
 """
 
+import errno
 import json
 import os
 import socket
@@ -185,7 +186,8 @@ class RealSpawnTests(LlamaServerTestCase):
 	def test_row6_child_exit_before_ready_fails_fast_with_exit_code_and_log_tail(self):
 		port = free_port()
 		config = self.make_config(port, startup_wait=120.0)  # a large budget the failure must beat
-		with mock.patch.dict(os.environ, {"FAKE_EXIT_CODE": "7", "FAKE_EXIT_MESSAGE": "設定檔壞掉了"}):
+		# A cp950 child stdout reproduces a Traditional Chinese Windows locale on any OS.
+		with mock.patch.dict(os.environ, {"FAKE_EXIT_CODE": "7", "FAKE_EXIT_MESSAGE": "設定檔壞掉了", "PYTHONIOENCODING": "cp950"}):
 			started = time.monotonic()
 			with self.assertRaises(LlamaServerError) as caught:
 				self.ensure(config)
@@ -231,13 +233,19 @@ class SpawnFailureTests(LlamaServerTestCase):
 			created.append(instance)
 			return instance
 
-		with mock.patch("llama_server.ManagedLlamaServer", side_effect=spy_factory):
+		# Never really launch bad_exe: on Windows a non-PE .exe pops up the modal
+		# "Unsupported 16-Bit Application" dialog on every test run.
+		with mock.patch("llama_server.ManagedLlamaServer", side_effect=spy_factory), \
+				mock.patch("llama_server.subprocess.Popen", side_effect=OSError(errno.ENOEXEC, "Exec format error")) as popen:
 			with self.assertRaises(LlamaServerError) as caught:
 				ensure_llama_server(client, config=config, log_path=self.log_path, log=lambda *_: None)
 		self.assertIn(str(bad_exe), str(caught.exception))
 		self.assertEqual(len(created), 1)
 		self.assertIsNone(created[0]._log_file, "log handle must be closed, not leaked, on a failed spawn")
 		self.assertIsNone(created[0].process)
+		popen.assert_called_once()
+		argv = popen.call_args.args[0]
+		self.assertEqual(argv[0], str(bad_exe))
 
 	def test_item7_stop_survives_a_wait_timeout_even_after_kill(self):
 		config = self.make_config(free_port())

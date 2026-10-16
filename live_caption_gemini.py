@@ -89,6 +89,7 @@ live_caption_gemini.py
 import atexit
 import math
 import os
+import ntpath
 import sys
 import re
 import json
@@ -253,6 +254,8 @@ GLOSSARY_PATH = Path(__file__).parent / "glossary.json"
 
 # 用來自動把瀏覽器輸出裝置切到虛擬音訊線、結束時再切回去的小工具（NirSoft SoundVolumeView）
 SOUND_VOLUME_VIEW_PATH = Path(__file__).parent / "tools" / "SoundVolumeView.exe"
+# SoundVolumeView 的特殊裝置名稱：用它切換等於讓程式改回跟著系統預設的播放裝置
+DEFAULT_RENDER_DEVICE = "DefaultRenderDevice"
 
 # 第一次執行會照這份預設值建立 glossary.json，之後你可以自己編輯增減
 # （常客來賓名字、節目裡的哏、常出現的專有名詞都可以加進去）
@@ -289,10 +292,21 @@ def load_glossary() -> dict:
             data = json.load(f)
         if not isinstance(data, dict):
             raise ValueError("glossary.json 格式應該是一個 {\"日文\": \"中文\"} 物件")
-        return data
     except (json.JSONDecodeError, OSError, ValueError) as e:
         print(f"讀取 glossary.json 失敗，改用預設內容：{e}")
         return dict(_DEFAULT_GLOSSARY)
+
+    # 右邊不是文字的那一行（例如把幾種聽錯寫法寫成清單）沒辦法用：略過並印出怎麼改，免得以為有生效
+    glossary = {}
+    for heard, correct in data.items():
+        if not isinstance(correct, str):
+            print(
+                f"glossary.json 的 {json.dumps(heard, ensure_ascii=False)}: {json.dumps(correct, ensure_ascii=False)} "
+                "右邊不是文字，這一行已略過（一行只寫一種聽錯寫法，格式是 \"聽錯寫法\": \"正確寫法\"）"
+            )
+            continue
+        glossary[heard] = correct
+    return glossary
 
 
 def glossary_hint(glossary: dict) -> str:
@@ -310,6 +324,9 @@ def glossary_hint(glossary: dict) -> str:
         return ""
     variants: dict[str, list[str]] = {}
     for heard, correct in glossary.items():
+        # 也會收到沒經過 load_glossary 的對照表（例如比較工具 --glossary 直接讀的檔）
+        if not isinstance(correct, str):
+            continue
         correct = (correct or heard or "").strip()
         heard = (heard or "").strip()
         if not correct:
@@ -317,6 +334,8 @@ def glossary_hint(glossary: dict) -> str:
         names = variants.setdefault(correct, [])
         if heard and heard != correct and heard not in names:
             names.append(heard)
+    if not variants:
+        return ""
     lines = []
     for correct in sorted(variants):
         heard = variants[correct]
@@ -554,6 +573,11 @@ def _polish_with_local_model(
 	)
 
 
+def _rebuild_command(wav_path: "Path") -> str:
+    """之後重新整理這份錄音要執行的指令；用絕對路徑，在哪個資料夾貼上執行都可以。"""
+    return f'python "{os.path.abspath(__file__)}" --rebuild "{os.path.abspath(wav_path)}"'
+
+
 def rebuild_transcript_from_full_audio(
     wav_path: "Path",
     asr_model: "WhisperModel",
@@ -608,12 +632,14 @@ def rebuild_transcript_from_full_audio(
         if polished_parts is None:
             # 服務中途停掉：保留完整錄音，之後可以重新處理
             print(f"本機模型服務無法使用，已保留完整錄音：{wav_path}")
+            print(f"之後可以用這行指令重新處理：{_rebuild_command(wav_path)}")
             return None
     else:
         polished_parts, failed_batches = _polish_with_gemini(translator, ja_lines, system_prompt, glossary)
 
     if not polished_parts:
         print(f"翻譯模型沒有回傳任何內容，略過這份整理稿，已保留完整錄音：{wav_path}")
+        print(f"之後可以用這行指令重新處理：{_rebuild_command(wav_path)}")
         return None
 
     if translation_only:
@@ -627,9 +653,10 @@ def rebuild_transcript_from_full_audio(
             "準確度會比即時觀看時看到的字幕更好，內容照實呈現、沒有自己刪減。"
         )
     if failed_batches:
+        # 整理稿是拿來讀、分享的，不放絕對路徑（裡面有 Windows 使用者資料夾名稱）
         summary += (
             f"\n\n⚠️ 有 {failed_batches} 批整理失敗（可能撞到額度限制），這份整理稿有缺漏；"
-            f"完整錄音已保留在 {wav_path.name}，可以之後重新處理。"
+            f"完整錄音已保留在 {wav_path.name}，可以之後重新處理：`python live_caption_gemini.py --rebuild <這個錄音檔的路徑>`"
         )
     out_path = wav_path.with_name(wav_path.stem.replace("_audio", "") + "_notebooklm_style.md")
     header = [
@@ -649,6 +676,7 @@ def rebuild_transcript_from_full_audio(
     # 不然缺漏的那幾批內容就永遠找不回來了
     if failed_batches:
         print(f"有 {failed_batches} 批整理失敗，已保留完整錄音：{wav_path}")
+        print(f"之後可以用這行指令重新處理：{_rebuild_command(wav_path)}")
         return out_path
     try:
         wav_path.unlink()
@@ -731,8 +759,9 @@ def get_app_output_device(process_name: str, rows: list[dict] | None = None) -> 
 
     回傳 SoundVolumeView 的「Command-Line Friendly ID」（例如
     「Realtek(R) Audio／Device／Realtek HD Audio 2nd output／Render」，實際用反斜線分隔），可以直接拿去切回去；
-    同一張音效卡有好幾個輸出時也不會搞混。那個程式現在沒在播放聲音（沒有工作階段）、
-    或 SoundVolumeView 不存在時回傳 None。
+    同一張音效卡有好幾個輸出時也不會搞混。只看 Device State 是 Active 的工作階段；
+    那個程式現在沒在播放聲音（沒有 Active 的工作階段）、SoundVolumeView 太舊（2.43 以前
+    只有裝置那幾列會填 Device State，程式工作階段那幾列是空的），或 SoundVolumeView 不存在時回傳 None。
     """
     rows = _sound_volume_view_rows() if rows is None else rows
     target = process_name.lower()
@@ -741,7 +770,10 @@ def get_app_output_device(process_name: str, rows: list[dict] | None = None) -> 
         # 要用 Process Path 比對
         if row.get("Type") != "Application" or row.get("Direction") != "Render":
             continue
-        if Path(row.get("Process Path", "")).name.lower() != target:
+        # Inactive／Expired 的工作階段現在沒在播放，可能是以前用過的裝置留下來的，分不出哪個是現在的輸出裝置
+        if row.get("Device State") != "Active":
+            continue
+        if ntpath.basename(row.get("Process Path", "")).lower() != target:
             continue
         endpoint = _endpoint_id(row.get("Item ID", ""))
         for device in rows:
@@ -786,12 +818,41 @@ def set_app_output_device(process_name: str, device_name: str) -> bool:
         return False
 
 
+def remember_app_output_device(process_name: str, cable_device: str, rows: list[dict]) -> str | None:
+    """切到虛擬音訊線之前記下結束時要切回的裝置；None 代表結束時改回跟著系統預設的播放裝置"""
+    device = get_app_output_device(process_name, rows)
+    # 上次程式沒正常結束、瀏覽器還停在 CABLE 的話，也當成查不到，不要切回 CABLE
+    if device == cable_device:
+        return None
+    # 找不到同名裝置時 cable_device 只是「CABLE Input」這個字串，瀏覽器也可能停在別條 CABLE 上，直接比對會漏掉
+    if device and "CABLE" in device.upper():
+        return None
+    # 在系統預設裝置上播放多半只是跟著預設，結束時改回跟著預設，比把它固定在這個裝置好
+    if device == get_default_output_device(rows):
+        return None
+    return device
+
+
+def restore_app_output_device(process_name: str, original_device: str | None):
+    """結束時把程式的輸出裝置切回原本的裝置；original_device 是 None 就改回跟著系統預設的播放裝置。
+    SoundVolumeView 不存在時沒辦法切換，改成提醒使用者自己切回來。"""
+    if not SOUND_VOLUME_VIEW_PATH.exists():
+        print(f"請自己在 Windows 音量混音器裡把 {process_name} 的輸出裝置從「CABLE Input」改回原本的設定。")
+        return
+    if not set_app_output_device(process_name, original_device or DEFAULT_RENDER_DEVICE):
+        print(f"沒辦法自動切回 {process_name} 的輸出裝置，可能需要自己在音量混音器裡切回來。")
+    elif original_device:
+        print(f"已把 {process_name} 的輸出裝置切回「{original_device}」。")
+    else:
+        print(f"已把 {process_name} 的輸出裝置改回跟著系統預設的播放裝置。")
+
+
 class AudioRoutingRestorer:
     """把來源程式（瀏覽器）的輸出裝置切回原本的，而且只會做一次。
 
     同一個實例會掛在好幾個地方：main() 的 finally、atexit、主控台的關閉 / Ctrl+C 事件。
-    哪一個先觸發都可以，之後的呼叫什麼都不做，不會重複切換。開始時查不到原本的
-    裝置（瀏覽器那時沒在播放），就切回系統預設的播放裝置。
+    哪一個先觸發都可以，之後的呼叫什麼都不做，不會重複切換。切回哪個裝置交給
+    restore_app_output_device：查不到原本的裝置時，讓它改回跟著系統預設的播放裝置。
     """
 
     def __init__(self, process_name: str, original_device: str | None):
@@ -805,11 +866,7 @@ class AudioRoutingRestorer:
             if self._done:
                 return
             self._done = True
-        restore_device = self.original_device or get_default_output_device()
-        if restore_device and set_app_output_device(self.process_name, restore_device):
-            print(f"已把 {self.process_name} 的輸出裝置切回「{restore_device}」。")
-        else:
-            print(f"沒辦法自動切回 {self.process_name} 的輸出裝置，可能需要自己在音量混音器裡切回來。")
+        restore_app_output_device(self.process_name, self.original_device)
 
 
 def _install_console_close_handler(callback) -> None:
@@ -2303,11 +2360,8 @@ def main():
         if source_process_name and SOUND_VOLUME_VIEW_PATH.exists():
             sound_rows = _sound_volume_view_rows()
             cable_device = find_output_device("CABLE Input", sound_rows) or "CABLE Input"
-            # 瀏覽器現在沒在播放聲音的話查不到（None），結束時就改切回系統預設裝置；
-            # 上次程式沒正常結束、瀏覽器還停在 CABLE 的話，也當成查不到，不要切回 CABLE
-            original_output_device = get_app_output_device(source_process_name, sound_rows)
-            if original_output_device == cable_device:
-                original_output_device = None
+            # 瀏覽器現在沒在播放聲音的話查不到（None），結束時就改回跟著系統預設的播放裝置
+            original_output_device = remember_app_output_device(source_process_name, cable_device, sound_rows)
             # 切換之前先準備好「只會執行一次」的還原，掛在 atexit 和主控台關閉事件上；
             # 下面的 try/finally 也會呼叫它。哪個先觸發都可以，Brave 不會卡在 CABLE
             restore_audio_routing = AudioRoutingRestorer(source_process_name, original_output_device)
@@ -2377,6 +2431,9 @@ def main():
         # 結束時把來源程式的輸出裝置切回原本的（AudioRoutingRestorer 只會切一次）
         if restore_audio_routing is not None:
             restore_audio_routing()
+        elif source_process_name:
+            # 沒有 SoundVolumeView、沒辦法自動切換時，提醒使用者自己切回來
+            restore_app_output_device(source_process_name, original_output_device)
 
         # 等背景執行緒真的寫完檔案，再去讀來整理（中途出錯時執行緒可能根本還沒啟動，
         # 對沒啟動過的執行緒呼叫 join() 會丟出例外，蓋掉原本的錯誤）
@@ -2409,11 +2466,81 @@ def main():
             except Exception as e:
                 notebooklm_style_path = None
                 print(f"用完整錄音重新整理逐字稿時發生錯誤（不影響前面已經產生的逐字稿）：{e}")
+                if raw_audio_path.exists():
+                    print(f"之後可以用這行指令重新處理：{_rebuild_command(raw_audio_path)}")
 
             if notebooklm_style_path:
                 print(f"已產生用完整錄音重新辨識、準確度更好的逐字稿：{notebooklm_style_path}")
 
 
+def rebuild_saved_recording(wav_path: Path) -> "Path | None":
+    """重新整理之前保留下來的完整錄音（額度用完、本機模型服務停掉時會保留）。"""
+    if not wav_path.exists():
+        print(f"找不到錄音檔：{wav_path}")
+        return None
+    if not (wav_path.name.startswith("transcript_") and wav_path.name.endswith("_audio.wav")):
+        print(f"--rebuild 只能用在本程式保留下來的 transcript_..._audio.wav（整理成功後會把它刪除）：{wav_path}")
+        return None
+
+    from startup_gui import load_last_settings
+
+    # 翻譯引擎跟 main() 一樣：環境變數 TRANSLATION_BACKEND 優先，其次是上次的選擇，都沒有就用 Gemini
+    last = load_last_settings(SETTINGS_PATH)
+    try:
+        backend = resolve_translation_backend(
+            os.environ.get("TRANSLATION_BACKEND") or last.get("translation_backend")
+        )
+    except RuntimeError as e:
+        print(f"{e}，改用 Gemini API。")
+        backend = TRANSLATION_BACKEND_GEMINI
+    try:
+        translator = Translator(backend)
+    except RuntimeError as e:
+        print(f"翻譯引擎初始化失敗：{e}")
+        return None
+
+    try:
+        print("載入語音辨識模型（Whisper，第一次執行會自動下載）...")
+        asr = WhisperModel(WHISPER_MODEL_SIZE, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE_TYPE)
+        glossary = load_glossary()
+
+        # 節目名稱沿用同一場的原始逐字稿第一行（#TITLE:），重新整理後的標題才會跟原本一樣
+        raw_log_path = wav_path.with_name(wav_path.stem.replace("_audio", "") + ".txt")
+        episode_title = ""
+        if raw_log_path.exists():
+            # 節目名稱只是附帶資訊，讀不到（例如被另存成其他編碼）也照樣重新整理
+            try:
+                with open(raw_log_path, "r", encoding="utf-8") as f:
+                    title_m = _TITLE_LINE_RE.match(f.readline().rstrip("\n"))
+                episode_title = title_m.group(1).strip() if title_m else ""
+            except (OSError, UnicodeError) as e:
+                print(f"讀取 {raw_log_path.name} 的節目名稱失敗，改用預設標題：{e}")
+
+        out_path = rebuild_transcript_from_full_audio(wav_path, asr, translator, glossary, episode_title)
+    except Exception as e:
+        print(f"用完整錄音重新整理逐字稿時發生錯誤：{e}")
+        if wav_path.exists():
+            print(f"之後可以用這行指令重新處理：{_rebuild_command(wav_path)}")
+        return None
+
+    if out_path:
+        print(f"已產生用完整錄音重新辨識、準確度更好的逐字稿：{out_path}")
+    return out_path
+
+
+def _run_cli(argv: list[str]) -> int:
+    """沒有參數就照常開啟字幕程式；--rebuild <錄音檔> 重新整理之前保留下來的完整錄音。"""
+    if not argv:
+        main()
+        return 0
+    if len(argv) == 2 and argv[0] == "--rebuild":
+        return 0 if rebuild_saved_recording(Path(argv[1])) else 1
+    print("用法：python live_caption_gemini.py [--rebuild transcripts\\transcript_..._audio.wav]")
+    return 2
+
+
 if __name__ == "__main__":
     multiprocessing.freeze_support()  # 打包成 exe 的情況下保護用，一般直接跑 python 也不影響
-    main()
+    exit_code = _run_cli(sys.argv[1:])
+    if exit_code:
+        sys.exit(exit_code)

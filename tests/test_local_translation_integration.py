@@ -473,6 +473,42 @@ class WhisperModelConfigTests(TranslationBackendTestCase):
 
 
 class GlossaryFileTests(TranslationBackendTestCase):
+	def test_glossary_hint_skips_values_that_are_not_strings(self):
+		valid = {"陽宮ひな": "羊宮妃那", "HOOOOPE": "HOOOOPE", "鈴木": ""}
+		for value in (["ゆみやひな", "陽宮ひな"], 1, True, {"正確寫法": "こもれびじかん"}, None):
+			with self.subTest(value=value):
+				hint = self.app.glossary_hint({**valid, "こもれびじかん": value})
+				self.assertEqual(hint, self.app.glossary_hint(valid))
+				self.assertIn("- 羊宮妃那（聽寫可能寫成：陽宮ひな）", hint)
+				self.assertIn("- 鈴木\n", hint + "\n")
+				self.assertEqual(self.app.glossary_hint({"こもれびじかん": value}), "")
+		self.assertEqual(self.app.glossary_hint({"": ""}), "")
+
+	def test_load_glossary_skips_and_reports_values_that_are_not_strings(self):
+		valid = {"ようみやひな": "羊宮妃那", "ホープ": "HOOOOPE", "鈴木": ""}
+		invalid = {"羊宮妃那": ["ゆみやひな", "陽宮ひな"], "HOOOOPE": 1, "こもれびじかん": True, "番組": {"正確寫法": "ばんぐみ"}, "田中": None}
+		with tempfile.TemporaryDirectory() as temp_dir:
+			path = Path(temp_dir) / "glossary.json"
+			path.write_text(json.dumps({**valid, **invalid}, ensure_ascii=False, indent=2), encoding="utf-8")
+			with mock.patch.object(self.app, "GLOSSARY_PATH", path):
+				glossary = self.app.load_glossary()
+		self.assertEqual(glossary, valid)
+		lines = self.printed_text().splitlines()
+		for key, value in invalid.items():
+			with self.subTest(key=key):
+				self.assertTrue(any(key in line and json.dumps(value, ensure_ascii=False) in line and '"聽錯寫法": "正確寫法"' in line for line in lines), lines)
+		for key in valid:
+			self.assertNotIn(key, self.printed_text())
+
+	def test_live_caption_still_translates_when_a_glossary_value_is_not_a_string(self):
+		# Worker.run calls translate_with_context with no try around it, so a raise here would
+		# stop the captions for the rest of the session.
+		translator, calls = self.gemini_translator(lambda contents, n: "羊宮妃那來了。")
+		glossary = {"陽宮ひな": "羊宮妃那", "羊宮妃那": ["ゆみやひな", "陽宮ひな"], "HOOOOPE": 1}
+		self.assertEqual(translator.translate_with_context("", "陽宮ひなが来ました。", glossary), "羊宮妃那來了。")
+		self.assertEqual(len(calls), 1)
+		self.assertIn("- 羊宮妃那（聽寫可能寫成：陽宮ひな）", calls[0]["system_instruction"])
+
 	def test_load_glossary_recreates_the_default_file_when_missing(self):
 		# glossary.json is now gitignored (a user's own list should not conflict with git
 		# pull); a fresh clone must still work by falling back to _DEFAULT_GLOSSARY.
@@ -510,8 +546,28 @@ SOUND_ROWS = [
 	 "Item ID": "{0.0.0.00000000}.{ccc}", "Command-Line Friendly ID": "VB-Audio Virtual Cable\\Device\\CABLE Input\\Render"},
 	# 程式工作階段那一列的 Name 是顯示名稱（Brave），不是 brave.exe
 	{"Name": "Brave", "Type": "Application", "Direction": "Render", "Default": "",
+	 "Device State": "Active",  # SoundVolumeView 2.43 起，程式工作階段那幾列也會填這個欄位
 	 "Item ID": "{0.0.0.00000000}.{bbb}|\\Device\\HarddiskVolume3\\Program Files\\Brave\\brave.exe%b{0}|1%b42",
 	 "Process Path": "C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe"},
+]
+
+# 程式以前用過的裝置上會留著 Inactive／Expired 的工作階段；裝置沿用 SOUND_ROWS 前三列（喇叭是系統預設）
+SESSION_ROWS = SOUND_ROWS[:3] + [
+	{"Name": "Firefox", "Type": "Application", "Direction": "Render", "Default": "", "Device State": "Inactive",
+	 "Item ID": "{0.0.0.00000000}.{bbb}|\\Device\\HarddiskVolume3\\Program Files\\Mozilla Firefox\\firefox.exe%b{0}|1%b7",
+	 "Process Path": "C:\\Program Files\\Mozilla Firefox\\firefox.exe"},
+	{"Name": "Firefox", "Type": "Application", "Direction": "Render", "Default": "", "Device State": "Active",
+	 "Item ID": "{0.0.0.00000000}.{aaa}|\\Device\\HarddiskVolume3\\Program Files\\Mozilla Firefox\\firefox.exe%b{0}|1%b7",
+	 "Process Path": "C:\\Program Files\\Mozilla Firefox\\firefox.exe"},
+	{"Name": "Microsoft Edge", "Type": "Application", "Direction": "Render", "Default": "", "Device State": "Inactive",
+	 "Item ID": "{0.0.0.00000000}.{aaa}|\\Device\\HarddiskVolume3\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe%b{0}|1%b9",
+	 "Process Path": "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"},
+	{"Name": "Microsoft Edge", "Type": "Application", "Direction": "Render", "Default": "", "Device State": "Expired",
+	 "Item ID": "{0.0.0.00000000}.{bbb}|\\Device\\HarddiskVolume3\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe%b{0}|1%b9",
+	 "Process Path": "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"},
+	{"Name": "Google Chrome", "Type": "Application", "Direction": "Render", "Default": "", "Device State": "Active",
+	 "Item ID": "{0.0.0.00000000}.{ccc}|\\Device\\HarddiskVolume3\\Program Files\\Google\\Chrome\\Application\\chrome.exe%b{0}|1%b5",
+	 "Process Path": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"},
 ]
 
 
@@ -583,19 +639,19 @@ class AudioRoutingTests(TranslationBackendTestCase):
 		self.assertIsNone(self.app.find_output_device("不存在的裝置", SOUND_ROWS))
 
 	def test_restorer_switches_back_only_once(self):
-		with mock.patch.object(self.app, "set_app_output_device", return_value=True) as set_device, \
-				mock.patch("builtins.print"):
+		self.patch_sound_volume_view()
+		with mock.patch.object(self.app, "set_app_output_device", return_value=True) as set_device:
 			restore = self.app.AudioRoutingRestorer("brave.exe", "Realtek(R) Audio\\Device\\耳機\\Render")
 			restore()
 			restore()  # finally + atexit + console handler may all fire
 		set_device.assert_called_once_with("brave.exe", "Realtek(R) Audio\\Device\\耳機\\Render")
 
-	def test_restorer_falls_back_to_the_system_default_device(self):
-		with mock.patch.object(self.app, "set_app_output_device", return_value=True) as set_device, \
-				mock.patch.object(self.app, "get_default_output_device", return_value="FxSound Audio Enhancer\\Device\\喇叭\\Render"), \
-				mock.patch("builtins.print"):
+	def test_restorer_without_a_remembered_device_follows_the_system_default(self):
+		# goes through restore_app_output_device: back to "follow the system default", not pinned
+		self.patch_sound_volume_view()
+		with mock.patch.object(self.app, "set_app_output_device", return_value=True) as set_device:
 			self.app.AudioRoutingRestorer("brave.exe", None)()
-		set_device.assert_called_once_with("brave.exe", "FxSound Audio Enhancer\\Device\\喇叭\\Render")
+		set_device.assert_called_once_with("brave.exe", "DefaultRenderDevice")
 
 	def test_console_close_event_runs_the_restorer(self):
 		handlers = []
@@ -608,6 +664,88 @@ class AudioRoutingTests(TranslationBackendTestCase):
 			self.app._install_console_close_handler(callback)
 		self.assertFalse(handlers[0](2))  # CTRL_CLOSE_EVENT: run it, but let Windows continue
 		callback.assert_called_once_with()
+
+	def test_inactive_session_listed_first_is_not_the_current_device(self):
+		self.assertEqual(self.app.get_app_output_device("firefox.exe", SESSION_ROWS),
+			"FxSound Audio Enhancer\\Device\\喇叭\\Render")
+
+	def test_app_with_only_inactive_sessions_returns_none(self):
+		self.assertIsNone(self.app.get_app_output_device("msedge.exe", SESSION_ROWS))
+
+	def test_session_without_device_state_returns_none(self):
+		# SoundVolumeView 2.43 以前，程式工作階段那幾列的 Device State 是空的
+		old_rows = [{**row, "Device State": ""} if row["Type"] == "Application" else row for row in SOUND_ROWS]
+		self.assertIsNone(self.app.get_app_output_device("brave.exe", old_rows))
+
+	def test_remember_skips_a_session_on_the_system_default_device(self):
+		cable = "VB-Audio Virtual Cable\\Device\\CABLE Input\\Render"
+		self.assertIsNone(self.app.remember_app_output_device("firefox.exe", cable, SESSION_ROWS))
+
+	def test_remember_skips_a_session_left_on_cable(self):
+		cable = "VB-Audio Virtual Cable\\Device\\CABLE Input\\Render"
+		self.assertIsNone(self.app.remember_app_output_device("chrome.exe", cable, SESSION_ROWS))
+
+	def test_remember_keeps_a_session_on_another_device(self):
+		cable = "VB-Audio Virtual Cable\\Device\\CABLE Input\\Render"
+		self.assertEqual(self.app.remember_app_output_device("brave.exe", cable, SOUND_ROWS),
+			"Realtek(R) Audio\\Device\\Realtek HD Audio 2nd output\\Render")
+
+	def patch_sound_volume_view(self, exists=True):
+		# 只是讓 exists() 成立的空檔案；用到的測試都把 set_app_output_device 換掉了，不會真的去執行它
+		temp_dir = tempfile.TemporaryDirectory()
+		self.addCleanup(temp_dir.cleanup)
+		path = Path(temp_dir.name) / "SoundVolumeView.exe"
+		if exists:
+			path.write_bytes(b"")
+		patcher = mock.patch.object(self.app, "SOUND_VOLUME_VIEW_PATH", path)
+		patcher.start()
+		self.addCleanup(patcher.stop)
+
+	def test_restore_without_a_remembered_device_follows_the_system_default(self):
+		self.patch_sound_volume_view()
+		with mock.patch.object(self.app, "set_app_output_device", return_value=True) as set_device:
+			self.app.restore_app_output_device("brave.exe", None)
+		set_device.assert_called_once_with("brave.exe", "DefaultRenderDevice")
+		self.assertIn("跟著系統預設的播放裝置", self.printed_text())
+		self.assertNotIn("沒辦法自動切回", self.printed_text())
+
+	def test_restore_switches_back_to_the_remembered_device(self):
+		self.patch_sound_volume_view()
+		device = "Realtek(R) Audio\\Device\\Realtek HD Audio 2nd output\\Render"
+		with mock.patch.object(self.app, "set_app_output_device", return_value=True) as set_device:
+			self.app.restore_app_output_device("brave.exe", device)
+		set_device.assert_called_once_with("brave.exe", device)
+		self.assertIn(f"已把 brave.exe 的輸出裝置切回「{device}」。", self.printed_text())
+		self.assertNotIn("沒辦法自動切回", self.printed_text())
+
+	def test_restore_failure_asks_to_switch_back_by_hand(self):
+		self.patch_sound_volume_view()
+		with mock.patch.object(self.app, "set_app_output_device", return_value=False):
+			self.app.restore_app_output_device("brave.exe", None)
+		self.assertIn("沒辦法自動切回 brave.exe 的輸出裝置，可能需要自己在音量混音器裡切回來。", self.printed_text())
+		self.assertNotIn("已把", self.printed_text())
+
+	def test_restore_without_sound_volume_view_asks_to_switch_back_by_hand(self):
+		self.patch_sound_volume_view(exists=False)
+		with mock.patch.object(self.app, "set_app_output_device") as set_device:
+			self.app.restore_app_output_device("brave.exe", None)
+		self.assertIn("請自己在 Windows 音量混音器裡把 brave.exe 的輸出裝置從「CABLE Input」改回原本的設定。", self.printed_text())
+		set_device.assert_not_called()
+
+	def test_remember_skips_a_session_left_on_another_cable(self):
+		# 沒有名稱剛好是 CABLE Input 的裝置時，main() 傳進來的只是「CABLE Input」這個字串
+		rows = SOUND_ROWS[:2] + [
+			{"Name": "CABLE In 16ch", "Type": "Device", "Direction": "Render", "Default": "",
+			 "Item ID": "{0.0.0.00000000}.{ddd}", "Command-Line Friendly ID": "VB-Audio Virtual Cable\\Device\\CABLE In 16ch\\Render"},
+			{"Name": "Brave", "Type": "Application", "Direction": "Render", "Default": "", "Device State": "Active",
+			 "Item ID": "{0.0.0.00000000}.{ddd}|\\Device\\HarddiskVolume3\\Program Files\\Brave\\brave.exe%b{0}|1%b42",
+			 "Process Path": "C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe"},
+		]
+		self.assertIsNone(self.app.remember_app_output_device("brave.exe", "CABLE Input", rows))
+
+	def test_remember_without_an_active_session_returns_none(self):
+		cable = "VB-Audio Virtual Cable\\Device\\CABLE Input\\Render"
+		self.assertIsNone(self.app.remember_app_output_device("msedge.exe", cable, SESSION_ROWS))
 
 
 class WorkflowWiringTests(TranslationBackendTestCase):
@@ -680,6 +818,226 @@ class WorkflowWiringTests(TranslationBackendTestCase):
 		self.assertIn("cuBLAS", warning[2])
 		self.assertEqual(caption[1:], ("よろしく", "請多指教"))
 		self.assertIn("cuBLAS", " ".join(str(c.args) for c in printed.call_args_list))
+
+
+
+class KeptRecordingCommandTests(TranslationBackendTestCase):
+	"""Every message that keeps the recording must say how to re-process it; the console gives the exact command."""
+
+	def assert_rebuild_command(self, text, wav_path):
+		import re
+
+		match = re.search(r'python "([^"]+)" --rebuild "([^"]+)"', text)
+		self.assertIsNotNone(match, text)
+		script, wav = match.groups()
+		# Absolute paths, so the command works whichever folder it is pasted into.
+		self.assertTrue(os.path.isabs(script) and os.path.isabs(wav), match.group(0))
+		self.assertTrue(os.path.samefile(script, self.app.__file__), script)
+		self.assertTrue(os.path.samefile(wav, wav_path), wav)
+
+	def test_rebuild_command_makes_a_relative_recording_path_absolute(self):
+		relative = Path("transcripts/transcript_20260926_010203_audio.wav")
+		command = self.app._rebuild_command(relative)
+		self.assertTrue(command.endswith(f' --rebuild "{os.path.abspath(relative)}"'), command)
+
+	def test_partial_failure_transcript_gives_the_rebuild_command_without_local_paths(self):
+		translator, _ = self.gemini_translator(lambda contents, n: "" if n <= 3 else f"批次{n}")
+		out_path, wav_path = self.run_reconstruction(translator, [f"日文{i}です。" for i in range(61)])
+		text = out_path.read_text(encoding="utf-8")
+		self.assertIn("--rebuild", text)
+		self.assertIn(wav_path.name, text)
+		# The transcript is meant to be read and shared; absolute paths would expose the user's folder.
+		self.assertNotIn(str(wav_path.parent), text)
+		self.assertNotIn(os.path.abspath(self.app.__file__), text)
+
+	def test_partial_failure_console_message_gives_the_rebuild_command(self):
+		translator, _ = self.gemini_translator(lambda contents, n: "" if n <= 3 else f"批次{n}")
+		_, wav_path = self.run_reconstruction(translator, [f"日文{i}です。" for i in range(61)])
+		self.assert_rebuild_command(self.printed_text(), wav_path)
+
+	def test_empty_translation_console_message_gives_the_rebuild_command(self):
+		translator, _ = self.gemini_translator(lambda contents, n: "")
+		out_path, wav_path = self.run_reconstruction(translator, ["日文です。"])
+		self.assertIsNone(out_path)
+		self.assert_rebuild_command(self.printed_text(), wav_path)
+
+	def test_local_service_died_console_message_gives_the_rebuild_command(self):
+		translator, _ = self.local_translator(lambda system, user: LocalLLMError("連線失敗", retryable=True, kind="connection"))
+		out_path, wav_path = self.run_reconstruction(translator, ["日文です。"])
+		self.assertIsNone(out_path)
+		self.assert_rebuild_command(self.printed_text(), wav_path)
+
+
+
+class SavedRecordingRebuildTests(TranslationBackendTestCase):
+	"""rebuild_saved_recording re-processes a kept recording with the backend main() would pick."""
+
+	def saved_recording(self, name="transcript_20260926_010203_audio.wav", title="節目", settings=None):
+		temp_dir = tempfile.TemporaryDirectory()
+		self.addCleanup(temp_dir.cleanup)
+		folder = Path(temp_dir.name)
+		wav_path = folder / name
+		wav_path.write_bytes(b"RIFF")
+		if title is not None:
+			(folder / "transcript_20260926_010203.txt").write_text(f"#TITLE: {title}\n\n", encoding="utf-8")
+		settings_path = folder / "last_settings.json"
+		if settings is not None:
+			settings_path.write_text(json.dumps(settings), encoding="utf-8")
+		patcher = mock.patch.object(self.app, "SETTINGS_PATH", settings_path)
+		patcher.start()
+		self.addCleanup(patcher.stop)
+		return wav_path
+
+	def rebuild_saved(self, wav_path, translator_error=None, whisper_error=None, rebuild_error=None):
+		"""Run rebuild_saved_recording with the models and the rebuild step itself mocked out."""
+		with mock.patch.object(self.app, "Translator", side_effect=translator_error) as translator_class, \
+				mock.patch.object(self.app, "WhisperModel", side_effect=whisper_error) as whisper_class, \
+				mock.patch.object(self.app, "load_glossary", return_value={"田中": "田中"}), \
+				mock.patch.object(
+					self.app, "rebuild_transcript_from_full_audio", return_value=Path("out.md"), side_effect=rebuild_error
+				) as rebuild:
+			result = self.app.rebuild_saved_recording(wav_path)
+		return result, translator_class, whisper_class, rebuild
+
+	def test_rebuild_uses_the_backend_main_would_pick_the_glossary_and_the_episode_title(self):
+		cases = (
+			({"TRANSLATION_BACKEND": "local"}, {"translation_backend": "gemini"}, "local"),
+			({}, {"translation_backend": "local"}, "local"),
+			({}, None, "gemini"),
+			({"TRANSLATION_BACKEND": "ollama"}, {"translation_backend": "local"}, "gemini"),
+		)
+		for env, settings, expected in cases:
+			with self.subTest(env=env, settings=settings), mock.patch.dict(os.environ, env):
+				wav_path = self.saved_recording(settings=settings)
+				result, translator_class, whisper_class, rebuild = self.rebuild_saved(wav_path)
+				self.assertEqual(result, Path("out.md"))
+				translator_class.assert_called_once_with(expected)
+				whisper_class.assert_called_once_with(
+					self.app.WHISPER_MODEL_SIZE, device=self.app.WHISPER_DEVICE, compute_type=self.app.WHISPER_COMPUTE_TYPE
+				)
+				rebuild.assert_called_once_with(
+					wav_path, whisper_class.return_value, translator_class.return_value, {"田中": "田中"}, "節目"
+				)
+		self.assertIn("改用 Gemini API", self.printed_text())
+
+	def test_rebuild_without_the_raw_transcript_has_no_episode_title(self):
+		_, _, _, rebuild = self.rebuild_saved(self.saved_recording(title=None))
+		self.assertEqual(rebuild.call_args.args[4], "")
+
+	def test_unreadable_raw_transcript_still_rebuilds_without_an_episode_title(self):
+		wav_path = self.saved_recording(title=None)
+		# Re-saved as Big5 (Notepad's ANSI on a Taiwanese Windows), so it is not valid UTF-8.
+		wav_path.with_name("transcript_20260926_010203.txt").write_bytes("#TITLE: 節目\n\n".encode("big5"))
+		result, translator_class, whisper_class, rebuild = self.rebuild_saved(wav_path)
+		self.assertEqual(result, Path("out.md"))
+		rebuild.assert_called_once_with(
+			wav_path, whisper_class.return_value, translator_class.return_value, {"田中": "田中"}, ""
+		)
+		self.assertRegex(self.printed_text(), r"讀取 transcript_20260926_010203\.txt 的節目名稱失敗，改用預設標題：.*can't decode")
+		self.assertNotIn("用完整錄音重新整理逐字稿時發生錯誤", self.printed_text())
+
+	def test_success_prints_where_the_new_transcript_is(self):
+		result, _, _, _ = self.rebuild_saved(self.saved_recording())
+		self.assertEqual(result, Path("out.md"))
+		self.assertIn("已產生用完整錄音重新辨識、準確度更好的逐字稿：out.md", self.printed_text())
+
+	def test_rebuild_error_returns_none_and_prints_the_command_to_try_again(self):
+		wav_path = self.saved_recording()
+		error = RuntimeError("Library cublas64_12.dll is not found or cannot be loaded")
+		result, _, _, _ = self.rebuild_saved(wav_path, rebuild_error=error)
+		self.assertIsNone(result)
+		self.assertIn("用完整錄音重新整理逐字稿時發生錯誤：Library cublas64_12.dll is not found", self.printed_text())
+		self.assertIn(f"之後可以用這行指令重新處理：{self.app._rebuild_command(wav_path)}", self.printed_text())
+		self.assertTrue(wav_path.exists())
+
+	def test_whisper_load_error_returns_none_and_prints_the_command_to_try_again(self):
+		wav_path = self.saved_recording()
+		error = RuntimeError("CUDA failed with error no CUDA-capable device is detected")
+		result, translator_class, whisper_class, rebuild = self.rebuild_saved(wav_path, whisper_error=error)
+		self.assertIsNone(result)
+		# Built before the slow Whisper load, so a bad API key is reported without waiting for the model.
+		translator_class.assert_called_once()
+		whisper_class.assert_called_once()
+		rebuild.assert_not_called()
+		self.assertIn("用完整錄音重新整理逐字稿時發生錯誤：CUDA failed with error no CUDA-capable device", self.printed_text())
+		self.assertIn(f"之後可以用這行指令重新處理：{self.app._rebuild_command(wav_path)}", self.printed_text())
+		self.assertTrue(wav_path.exists())
+
+	def test_rebuild_error_after_the_recording_was_deleted_does_not_print_the_command(self):
+		wav_path = self.saved_recording()
+
+		def delete_then_fail(wav, *_):
+			wav.unlink()
+			raise RuntimeError("整理到一半發生錯誤")
+
+		result, _, _, _ = self.rebuild_saved(wav_path, rebuild_error=delete_then_fail)
+		self.assertIsNone(result)
+		self.assertFalse(wav_path.exists())
+		self.assertIn("用完整錄音重新整理逐字稿時發生錯誤：整理到一半發生錯誤", self.printed_text())
+		# The recording is gone, so the command could only answer 找不到錄音檔.
+		self.assertNotIn("之後可以用這行指令重新處理", self.printed_text())
+
+	def test_missing_recording_returns_none_before_loading_any_model(self):
+		temp_dir = tempfile.TemporaryDirectory()
+		self.addCleanup(temp_dir.cleanup)
+		missing = Path(temp_dir.name) / "transcript_20260926_010203_audio.wav"
+		result, translator_class, whisper_class, rebuild = self.rebuild_saved(missing)
+		self.assertIsNone(result)
+		translator_class.assert_not_called()
+		whisper_class.assert_not_called()
+		rebuild.assert_not_called()
+		self.assertIn(str(missing), self.printed_text())
+
+	def test_audio_the_app_did_not_keep_is_refused_before_loading_any_model(self):
+		# A successful rebuild deletes its input, so it must only ever touch the app's own recordings.
+		for name in ("podcast.wav", "podcast_audio.wav", "transcript_20260926_010203_notebooklm_style.md"):
+			with self.subTest(name=name):
+				other = self.saved_recording(name=name)
+				result, translator_class, whisper_class, rebuild = self.rebuild_saved(other)
+				self.assertIsNone(result)
+				translator_class.assert_not_called()
+				whisper_class.assert_not_called()
+				rebuild.assert_not_called()
+				self.assertEqual(other.read_bytes(), b"RIFF")
+				self.assertIn(str(other), self.printed_text())
+
+	def test_translator_failure_returns_none_before_loading_whisper(self):
+		error = RuntimeError("找不到 Gemini API 金鑰")
+		result, _, whisper_class, rebuild = self.rebuild_saved(self.saved_recording(), translator_error=error)
+		self.assertIsNone(result)
+		whisper_class.assert_not_called()
+		rebuild.assert_not_called()
+		self.assertIn("翻譯引擎初始化失敗：找不到 Gemini API 金鑰", self.printed_text())
+
+
+
+class RebuildCommandLineTests(TranslationBackendTestCase):
+	def test_no_arguments_open_the_app_as_before(self):
+		with mock.patch.object(self.app, "main") as main, \
+				mock.patch.object(self.app, "rebuild_saved_recording") as rebuild:
+			self.assertEqual(self.app._run_cli([]), 0)
+		main.assert_called_once_with()
+		rebuild.assert_not_called()
+
+	def test_rebuild_exit_code_says_whether_a_transcript_was_produced(self):
+		wav = "transcript_20260926_010203_audio.wav"
+		for produced, expected in ((Path("transcript_20260926_010203_notebooklm_style.md"), 0), (None, 1)):
+			with self.subTest(produced=produced):
+				with mock.patch.object(self.app, "main") as main, \
+						mock.patch.object(self.app, "rebuild_saved_recording", return_value=produced) as rebuild:
+					self.assertEqual(self.app._run_cli(["--rebuild", wav]), expected)
+				rebuild.assert_called_once_with(Path(wav))
+				main.assert_not_called()
+
+	def test_other_arguments_print_usage_and_exit_2(self):
+		for argv in (["--help"], ["--rebuild"], ["transcript_20260926_010203_audio.wav"], ["--rebuild", "a.wav", "b.wav"]):
+			with self.subTest(argv=argv):
+				with mock.patch.object(self.app, "main") as main, \
+						mock.patch.object(self.app, "rebuild_saved_recording") as rebuild:
+					self.assertEqual(self.app._run_cli(argv), 2)
+				main.assert_not_called()
+				rebuild.assert_not_called()
+		self.assertIn("--rebuild", self.printed_text())
 
 
 
