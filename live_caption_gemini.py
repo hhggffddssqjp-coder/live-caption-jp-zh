@@ -852,18 +852,26 @@ def find_output_device(name: str, rows: list[dict] | None = None) -> str | None:
     return None
 
 
-def set_app_output_device(process_name: str, device_name: str) -> bool:
-    """用 SoundVolumeView 把某個程式的輸出裝置切換成指定裝置，成功回傳 True"""
+def set_app_output_device(process_name: str, device_name: str, timeout: float = 10.0) -> bool:
+    """用 SoundVolumeView 把某個程式的輸出裝置切換成指定裝置，成功回傳 True。
+
+    注意：實測 SoundVolumeView 2.53 的 /SetAppDefault 就算裝置或程式不存在，結束碼也是 0，
+    所以回傳 True 只代表「指令有順利執行完」，不保證真的切換成功。結束碼不是 0、
+    逾時、或根本執行不了時才回傳 False。timeout 是每一次呼叫的秒數（要呼叫兩次）。
+    """
     if not SOUND_VOLUME_VIEW_PATH.exists():
         return False
     try:
         import subprocess
 
         for role in ("console", "multimedia"):
-            subprocess.run(
+            result = subprocess.run(
                 [str(SOUND_VOLUME_VIEW_PATH), "/SetAppDefault", device_name, role, process_name],
-                timeout=10, capture_output=True,
+                timeout=timeout, capture_output=True,
             )
+            if result.returncode != 0:
+                print(f"切換 {process_name} 輸出裝置失敗（SoundVolumeView 結束碼 {result.returncode}）")
+                return False
         return True
     except Exception as e:
         print(f"切換 {process_name} 輸出裝置失敗：{e}")
@@ -885,47 +893,65 @@ def remember_app_output_device(process_name: str, cable_device: str, rows: list[
     return device
 
 
-def restore_app_output_device(process_name: str, original_device: str | None):
+def restore_app_output_device(process_name: str, original_device: str | None, timeout: float = 10.0) -> bool:
     """結束時把程式的輸出裝置切回原本的裝置；original_device 是 None 就改回跟著系統預設的播放裝置。
-    SoundVolumeView 不存在時沒辦法切換，改成提醒使用者自己切回來。"""
+    SoundVolumeView 不存在時沒辦法切換，改成提醒使用者自己切回來。
+
+    回傳 True 代表「不用再試了」（切換指令成功，或根本沒有 SoundVolumeView 可以切）；
+    False 代表這次失敗，呼叫端可以再試一次。
+    """
     if not SOUND_VOLUME_VIEW_PATH.exists():
         print(f"請自己在 Windows 音量混音器裡把 {process_name} 的輸出裝置從「CABLE Input」改回原本的設定。")
-        return
-    if not set_app_output_device(process_name, original_device or DEFAULT_RENDER_DEVICE):
+        return True
+    if not set_app_output_device(process_name, original_device or DEFAULT_RENDER_DEVICE, timeout=timeout):
         print(f"沒辦法自動切回 {process_name} 的輸出裝置，可能需要自己在音量混音器裡切回來。")
-    elif original_device:
+        return False
+    if original_device:
         print(f"已把 {process_name} 的輸出裝置切回「{original_device}」。")
     else:
         print(f"已把 {process_name} 的輸出裝置改回跟著系統預設的播放裝置。")
+    return True
 
 
 class AudioRoutingRestorer:
-    """把來源程式（瀏覽器）的輸出裝置切回原本的，而且只會做一次。
+    """把來源程式（瀏覽器）的輸出裝置切回原本的，成功後就不會再做第二次。
 
     同一個實例會掛在好幾個地方：main() 的 finally、atexit、主控台的關閉 / Ctrl+C 事件。
-    哪一個先觸發都可以，之後的呼叫什麼都不做，不會重複切換。切回哪個裝置交給
-    restore_app_output_device：查不到原本的裝置時，讓它改回跟著系統預設的播放裝置。
+    哪一個先觸發都可以；成功之後的呼叫什麼都不做。以前是在嘗試之前就先標記「做過了」，
+    第一次失敗（例如逾時）之後，其他地方就再也不會重試；現在失敗會留給下一個觸發點
+    再試，最多 MAX_ATTEMPTS 次。切回哪個裝置交給 restore_app_output_device：查不到原本的
+    裝置時，讓它改回跟著系統預設的播放裝置。
     """
+
+    MAX_ATTEMPTS = 3
 
     def __init__(self, process_name: str, original_device: str | None):
         self.process_name = process_name
         self.original_device = original_device
         self._lock = threading.Lock()
         self._done = False
+        self._attempts = 0
 
-    def __call__(self) -> None:
+    def __call__(self, timeout: float = 10.0) -> None:
+        # 整個過程都拿著 lock：主控台事件和 finally 可能同時觸發，不能兩邊同時切換
         with self._lock:
             if self._done:
                 return
-            self._done = True
-        restore_app_output_device(self.process_name, self.original_device)
+            self._attempts += 1
+            succeeded = restore_app_output_device(self.process_name, self.original_device, timeout=timeout)
+            if succeeded or self._attempts >= self.MAX_ATTEMPTS:
+                self._done = True
+
+
+CONSOLE_CLOSE_TIMEOUT_SEC = 2.0  # 每次呼叫 SoundVolumeView 的上限；要呼叫兩次，總共在 5 秒內
 
 
 def _install_console_close_handler(callback) -> None:
-    """主控台視窗被直接關掉、按 Ctrl+C、登出或關機時，先執行 callback。
+    """主控台視窗被直接關掉、按 Ctrl+C、登出或關機時，先執行 callback(timeout=...)。
 
     直接關掉主控台時 Windows 會直接結束行程，finally 和 atexit 都不會跑；
-    這個事件處理器是唯一的機會（Windows 大約給 5 秒，夠呼叫 SoundVolumeView）。
+    這個事件處理器是唯一的機會。Windows 大約只給 5 秒，所以每次呼叫 SoundVolumeView
+    只等 CONSOLE_CLOSE_TIMEOUT_SEC 秒（平常它不到 1 秒就跑完），兩次加起來不會超過。
     回傳 False，讓 Ctrl+C 照常變成 KeyboardInterrupt。
     """
     try:
@@ -940,7 +966,7 @@ def _install_console_close_handler(callback) -> None:
             win32con.CTRL_LOGOFF_EVENT, win32con.CTRL_SHUTDOWN_EVENT,
         ):
             try:
-                callback()
+                callback(timeout=CONSOLE_CLOSE_TIMEOUT_SEC)
             except Exception as e:
                 print(f"結束時切回音訊輸出失敗：{e}")
         return False

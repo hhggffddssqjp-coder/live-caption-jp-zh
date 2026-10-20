@@ -749,14 +749,39 @@ class AudioRoutingTests(TranslationBackendTestCase):
 			restore = self.app.AudioRoutingRestorer("brave.exe", "Realtek(R) Audio\\Device\\耳機\\Render")
 			restore()
 			restore()  # finally + atexit + console handler may all fire
-		set_device.assert_called_once_with("brave.exe", "Realtek(R) Audio\\Device\\耳機\\Render")
+		set_device.assert_called_once_with("brave.exe", "Realtek(R) Audio\\Device\\耳機\\Render", timeout=10.0)
+
+	def test_restorer_retries_on_the_next_trigger_after_a_failure(self):
+		self.patch_sound_volume_view()
+		with mock.patch.object(self.app, "set_app_output_device", side_effect=[False, True]) as set_device:
+			restore = self.app.AudioRoutingRestorer("brave.exe", None)
+			restore()  # e.g. the console handler timed out
+			restore()  # finally / atexit tries again
+			restore()  # already succeeded: nothing more
+		self.assertEqual(set_device.call_count, 2)
+
+	def test_restorer_gives_up_after_max_attempts(self):
+		self.patch_sound_volume_view()
+		with mock.patch.object(self.app, "set_app_output_device", return_value=False) as set_device:
+			restore = self.app.AudioRoutingRestorer("brave.exe", None)
+			for _ in range(5):
+				restore()
+		self.assertEqual(set_device.call_count, self.app.AudioRoutingRestorer.MAX_ATTEMPTS)
+
+	def test_non_zero_exit_code_counts_as_a_failed_switch(self):
+		self.patch_sound_volume_view()
+		with mock.patch("subprocess.run", return_value=types.SimpleNamespace(returncode=3)):
+			self.assertFalse(self.app.set_app_output_device("brave.exe", "DefaultRenderDevice"))
+		with mock.patch("subprocess.run", return_value=types.SimpleNamespace(returncode=0)) as run:
+			self.assertTrue(self.app.set_app_output_device("brave.exe", "DefaultRenderDevice", timeout=2.0))
+		self.assertEqual(run.call_args.kwargs["timeout"], 2.0)
 
 	def test_restorer_without_a_remembered_device_follows_the_system_default(self):
 		# goes through restore_app_output_device: back to "follow the system default", not pinned
 		self.patch_sound_volume_view()
 		with mock.patch.object(self.app, "set_app_output_device", return_value=True) as set_device:
 			self.app.AudioRoutingRestorer("brave.exe", None)()
-		set_device.assert_called_once_with("brave.exe", "DefaultRenderDevice")
+		set_device.assert_called_once_with("brave.exe", "DefaultRenderDevice", timeout=10.0)
 
 	def test_console_close_event_runs_the_restorer(self):
 		handlers = []
@@ -768,7 +793,9 @@ class AudioRoutingTests(TranslationBackendTestCase):
 		with mock.patch.dict(sys.modules, {"win32api": win32api, "win32con": win32con}):
 			self.app._install_console_close_handler(callback)
 		self.assertFalse(handlers[0](2))  # CTRL_CLOSE_EVENT: run it, but let Windows continue
-		callback.assert_called_once_with()
+		# short per-call timeout so both SoundVolumeView calls fit in Windows' ~5 s close window
+		callback.assert_called_once_with(timeout=self.app.CONSOLE_CLOSE_TIMEOUT_SEC)
+		self.assertLessEqual(2 * self.app.CONSOLE_CLOSE_TIMEOUT_SEC, 5)
 
 	def test_inactive_session_listed_first_is_not_the_current_device(self):
 		self.assertEqual(self.app.get_app_output_device("firefox.exe", SESSION_ROWS),
@@ -809,8 +836,8 @@ class AudioRoutingTests(TranslationBackendTestCase):
 	def test_restore_without_a_remembered_device_follows_the_system_default(self):
 		self.patch_sound_volume_view()
 		with mock.patch.object(self.app, "set_app_output_device", return_value=True) as set_device:
-			self.app.restore_app_output_device("brave.exe", None)
-		set_device.assert_called_once_with("brave.exe", "DefaultRenderDevice")
+			self.assertTrue(self.app.restore_app_output_device("brave.exe", None))
+		set_device.assert_called_once_with("brave.exe", "DefaultRenderDevice", timeout=10.0)
 		self.assertIn("跟著系統預設的播放裝置", self.printed_text())
 		self.assertNotIn("沒辦法自動切回", self.printed_text())
 
@@ -819,7 +846,7 @@ class AudioRoutingTests(TranslationBackendTestCase):
 		device = "Realtek(R) Audio\\Device\\Realtek HD Audio 2nd output\\Render"
 		with mock.patch.object(self.app, "set_app_output_device", return_value=True) as set_device:
 			self.app.restore_app_output_device("brave.exe", device)
-		set_device.assert_called_once_with("brave.exe", device)
+		set_device.assert_called_once_with("brave.exe", device, timeout=10.0)
 		self.assertIn(f"已把 brave.exe 的輸出裝置切回「{device}」。", self.printed_text())
 		self.assertNotIn("沒辦法自動切回", self.printed_text())
 
