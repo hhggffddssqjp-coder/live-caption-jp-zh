@@ -327,6 +327,31 @@ class GeminiPathTests(TranslationBackendTestCase):
 		self.assertEqual(len(calls), 1)
 		self.assertFalse(wav_path.exists())
 
+	def test_gemini_reply_missing_a_quarter_passes_the_batch_check_but_keeps_the_wav(self):
+		# 45 of 60 lines is enough for the per-batch retry check (75%), so it is not retried,
+		# but deleting the only recording needs (almost) every line
+		lines = [f"日文{i}です。" for i in range(60)]
+		translator, calls = self.gemini_translator(lambda contents, n: bilingual_reply(contents, "缺", keep=45))
+		out_path, wav_path = self.run_reconstruction(translator, lines)
+		self.assertEqual(len(calls), 1)
+		self.assertTrue(wav_path.exists())
+		self.assertIn("少了 15 句", out_path.read_text(encoding="utf-8"))
+
+	def test_rebuild_coverage_counts_missing_placeholder_and_problem_lines(self):
+		lines = [f"日文{i}です。" for i in range(5)]
+		parts = [
+			"日文0です。\n譯文0\n\n日文1です。\n（翻譯失敗）",
+			"日文2です。\nこれは翻訳されていないです",  # still Japanese: a translation problem
+		]
+		self.assertEqual(self.app._rebuild_coverage(parts, lines, None), (2, 1, 1))
+
+	def test_rebuild_is_complete_allows_a_few_merged_lines_but_no_placeholders(self):
+		self.assertTrue(self.app._rebuild_is_complete(missing=3, placeholders=0, problems=0, total=60))
+		self.assertFalse(self.app._rebuild_is_complete(missing=4, placeholders=0, problems=0, total=60))
+		self.assertFalse(self.app._rebuild_is_complete(missing=0, placeholders=1, problems=0, total=60))
+		self.assertFalse(self.app._rebuild_is_complete(missing=0, placeholders=0, problems=4, total=60))
+		self.assertTrue(self.app._rebuild_is_complete(missing=1, placeholders=0, problems=1, total=5))
+
 
 
 class PromptParityTests(TranslationBackendTestCase):

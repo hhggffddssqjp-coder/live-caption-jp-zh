@@ -119,7 +119,8 @@ from faster_whisper import WhisperModel
 from silero_vad import load_silero_vad, VADIterator
 from audio_timing import AudioRingBuffer, PlaybackDriftTracker  # 時間對齊的純邏輯，可以單獨測試
 from local_translation import (
-    LocalTranslationEngine, bilingual_pairs_acceptable, parse_bilingual_pairs, translation_problem,
+    TRANSLATION_FAILED_TEXT, LocalTranslationEngine, bilingual_pairs_acceptable, parse_bilingual_pairs,
+    translation_problem,
 )
 from llama_server import LlamaServerError, ensure_llama_server
 
@@ -579,6 +580,31 @@ def _rebuild_command(wav_path: "Path") -> str:
     return f'python "{os.path.abspath(__file__)}" --rebuild "{os.path.abspath(wav_path)}"'
 
 
+def _rebuild_coverage(polished_parts: list[str], ja_lines: list[str], glossary: dict | None) -> tuple[int, int, int]:
+    """整份整理稿到底涵蓋了幾句：回傳 (缺少的句數, 「翻譯失敗」佔位的句數, 翻譯有問題的句數)。
+
+    不分 Gemini 或本機模型，最後都用同一個標準決定能不能刪錄音。每一批送出時的檢查
+    （bilingual_pairs_acceptable）比較寬鬆：只要涵蓋 75% 的句子就收，因為那是用來
+    決定要不要重試；但拿來決定「刪掉唯一的原始錄音」太鬆了，60 句只回 45 句也會被
+    當成完整。本機模型失敗的句子還會填「（翻譯失敗）」，以前這種情況錄音也照刪。
+    """
+    pairs = [pair for part in polished_parts for pair in parse_bilingual_pairs(part)]
+    placeholders = sum(1 for _, zh in pairs if zh.strip() == TRANSLATION_FAILED_TEXT)
+    problems = sum(
+        1 for ja, zh in pairs
+        if zh.strip() != TRANSLATION_FAILED_TEXT and translation_problem(zh, ja, glossary) is not None
+    )
+    missing = max(0, len(ja_lines) - len(pairs))
+    return missing, placeholders, problems
+
+
+def _rebuild_is_complete(missing: int, placeholders: int, problems: int, total: int) -> bool:
+    """可以放心刪錄音的標準：沒有任何「翻譯失敗」佔位；缺少的句數、翻譯有問題的句數
+    都不超過一點容許量（整理時會修正 Whisper 斷錯的句子，偶爾把兩句合成一句是正常的）"""
+    allowance = max(1, total // 20)
+    return placeholders == 0 and missing <= allowance and problems <= allowance
+
+
 def rebuild_transcript_from_full_audio(
     wav_path: "Path",
     asr_model: "WhisperModel",
@@ -653,10 +679,22 @@ def rebuild_transcript_from_full_audio(
             "這份逐字稿是結束播放後，用完整錄音重新辨識、翻譯模型看過完整上下文潤過的版本，"
             "準確度會比即時觀看時看到的字幕更好，內容照實呈現、沒有自己刪減。"
         )
-    if failed_batches:
+    missing, placeholders, problems = _rebuild_coverage(polished_parts, ja_lines, glossary)
+    complete = _rebuild_is_complete(missing, placeholders, problems, len(ja_lines))
+    keep_recording = bool(failed_batches) or not complete
+    if keep_recording:
+        reasons = []
+        if failed_batches:
+            reasons.append(f"有 {failed_batches} 批整理失敗（可能撞到額度限制）")
+        if missing:
+            reasons.append(f"少了 {missing} 句")
+        if placeholders:
+            reasons.append(f"{placeholders} 句翻譯失敗")
+        if problems:
+            reasons.append(f"{problems} 句翻譯可能有問題")
         # 整理稿是拿來讀、分享的，不放絕對路徑（裡面有 Windows 使用者資料夾名稱）
         summary += (
-            f"\n\n⚠️ 有 {failed_batches} 批整理失敗（可能撞到額度限制），這份整理稿有缺漏；"
+            f"\n\n⚠️ 這份整理稿可能有缺漏（{'、'.join(reasons)}，共 {len(ja_lines)} 句）；"
             f"完整錄音已保留在 {wav_path.name}，可以之後重新處理：`python live_caption_gemini.py --rebuild <這個錄音檔的路徑>`"
         )
     out_path = wav_path.with_name(wav_path.stem.replace("_audio", "") + "_notebooklm_style.md")
@@ -673,10 +711,11 @@ def rebuild_transcript_from_full_audio(
     out_path.write_text("\n".join(header) + "\n\n".join(polished_parts) + "\n", encoding="utf-8")
 
     # 逐字稿已經整理好了，完整錄音本來就只是拿來重新辨識用、不是給人聽的，
-    # 用完就刪掉，不用留著佔硬碟空間——但只要有任何一批整理失敗，就保留錄音，
-    # 不然缺漏的那幾批內容就永遠找不回來了
-    if failed_batches:
-        print(f"有 {failed_batches} 批整理失敗，已保留完整錄音：{wav_path}")
+    # 用完就刪掉，不用留著佔硬碟空間——但只要整理稿可能有缺漏，就保留錄音，
+    # 不然缺漏的內容就永遠找不回來了
+    if keep_recording:
+        print(f"整理稿可能有缺漏（失敗批數 {failed_batches}、少 {missing} 句、翻譯失敗 {placeholders} 句、"
+              f"可能有問題 {problems} 句，共 {len(ja_lines)} 句），已保留完整錄音：{wav_path}")
         print(f"之後可以用這行指令重新處理：{_rebuild_command(wav_path)}")
         return out_path
     try:
