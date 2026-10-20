@@ -345,6 +345,28 @@ class GeminiPathTests(TranslationBackendTestCase):
 		]
 		self.assertEqual(self.app._rebuild_coverage(parts, lines, None), (2, 1, 1))
 
+	def test_join_thread_reports_whether_the_thread_really_finished(self):
+		import threading
+		import time
+		self.assertTrue(self.app._join_thread(threading.Thread(target=lambda: None), 0.1))  # never started
+		done = threading.Thread(target=lambda: None)
+		done.start()
+		self.assertTrue(self.app._join_thread(done, 1.0))
+		release = threading.Event()
+		stuck = threading.Thread(target=release.wait, daemon=True)
+		stuck.start()
+		started = time.perf_counter()
+		self.assertFalse(self.app._join_thread(stuck, 0.2))  # timed out: must not pretend it ended
+		self.assertLess(time.perf_counter() - started, 1.0)
+		release.set()
+		stuck.join(timeout=1)
+
+	def test_worker_and_capture_do_not_shadow_thread_internals(self):
+		# Python 3.10-3.12 call Thread._stop() while joining; an Event stored there breaks join()
+		self.assertFalse(hasattr(self.app.Worker, "_stop") and not callable(getattr(self.app.Worker, "_stop")))
+		source = Path(self.app.__file__).read_text(encoding="utf-8")
+		self.assertNotIn("self._stop = threading.Event()", source)
+
 	def test_rebuild_is_complete_allows_a_few_merged_lines_but_no_placeholders(self):
 		self.assertTrue(self.app._rebuild_is_complete(missing=3, placeholders=0, problems=0, total=60))
 		self.assertFalse(self.app._rebuild_is_complete(missing=4, placeholders=0, problems=0, total=60))

@@ -575,6 +575,18 @@ def _polish_with_local_model(
 	)
 
 
+def _join_thread(thread: threading.Thread, timeout: float) -> bool:
+    """等執行緒結束；回傳它是不是真的結束了（從來沒啟動過的也算結束）。
+
+    對沒啟動過的執行緒呼叫 join() 會丟出例外，所以先看 ident；join(timeout) 時間到
+    不會告訴你結果，要再用 is_alive() 確認，不能假設已經結束。
+    """
+    if thread.ident is None:
+        return True
+    thread.join(timeout=timeout)
+    return not thread.is_alive()
+
+
 def _rebuild_command(wav_path: "Path") -> str:
     """之後重新整理這份錄音要執行的指令；用絕對路徑，在哪個資料夾貼上執行都可以。"""
     return f'python "{os.path.abspath(__file__)}" --rebuild "{os.path.abspath(wav_path)}"'
@@ -1339,7 +1351,7 @@ class AudioCapture(threading.Thread):
             min_silence_duration_ms=SILENCE_END_MS,
             speech_pad_ms=VAD_SPEECH_PAD_MS,
         )
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
 
     def start_recording(self) -> bool:
         """手動開始錄製完整音訊；已經在錄、或沒有指定檔名的話回傳 False。
@@ -1422,7 +1434,7 @@ class AudioCapture(threading.Thread):
         )
 
     def stop(self):
-        self._stop.set()
+        self._stop_event.set()
 
     def run(self):
         # 擷取用的區塊大小可以跟 VAD 窗格大小脫鉤，這裡用接近 32ms 的原生取樣數即可
@@ -1443,7 +1455,7 @@ class AudioCapture(threading.Thread):
         ring_sr = self.audio_ring.sample_rate if self.audio_ring is not None else self.stream_sr
         device_missing_warned = False
 
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             try:
                 read_started = time.perf_counter()
                 data = stream.read(block_frames, exception_on_overflow=False)
@@ -1470,7 +1482,7 @@ class AudioCapture(threading.Thread):
                     pass
 
                 time.sleep(0.5)
-                if self._stop.is_set():
+                if self._stop_event.is_set():
                     break
 
                 try:
@@ -1815,7 +1827,7 @@ class Worker(threading.Thread):
         )
         # main() 會先建好翻譯引擎（金鑰或本機服務有問題就在動到音訊設定前結束）
         self.translator = translator if translator is not None else Translator()
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
 
         # 用來偵測 Whisper 卡進「幻覺迴圈」：音訊有雜音/glitch 時，有時候會連續
         # 辨識出同一句幾乎一模一樣的短句（常常剛好是提示詞裡的專有名詞），而且
@@ -1838,11 +1850,11 @@ class Worker(threading.Thread):
         print(f"逐字稿將儲存於：{self.log_path}")
 
     def stop(self):
-        self._stop.set()
+        self._stop_event.set()
 
     def run(self):
         failures = 0  # 連續失敗幾句；成功一句就歸零
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             if self.pause_state is not None and self.pause_state.is_paused():
                 time.sleep(0.1)
                 continue
@@ -2474,14 +2486,19 @@ def main():
             # 沒有 SoundVolumeView、沒辦法自動切換時，提醒使用者自己切回來
             restore_app_output_device(source_process_name, original_output_device)
 
-        # 等背景執行緒真的寫完檔案，再去讀來整理（中途出錯時執行緒可能根本還沒啟動，
-        # 對沒啟動過的執行緒呼叫 join() 會丟出例外，蓋掉原本的錯誤）
-        if worker.ident is not None:
-            worker.join(timeout=5)
+        # 等背景執行緒真的結束，再去讀檔案來整理（中途出錯時執行緒可能根本還沒啟動，
+        # 對沒啟動過的執行緒呼叫 join() 會丟出例外，蓋掉原本的錯誤）。
+        # Worker 可能正在等一個翻譯請求（最多 GEMINI_LIVE_TIMEOUT_SEC）或在辨識，給它
+        # 足夠的時間；以前只等 5 秒、也不檢查有沒有真的結束，事後整理就可能跟還在跑的
+        # Worker 同時使用同一個 Whisper 模型和翻譯引擎
+        worker_done = _join_thread(worker, GEMINI_LIVE_TIMEOUT_SEC + 15)
         # 完整錄音的 WAV 檔要等 AudioCapture 執行緒真的跑完、把檔案關閉寫入磁碟，
         # 才能安全地拿去重新辨識——不然可能讀到還沒寫完、不完整的檔案
-        if audio_capture.ident is not None:
-            audio_capture.join(timeout=5)
+        audio_done = _join_thread(audio_capture, 10)
+        if not worker_done:
+            print("辨識/翻譯的背景工作還沒結束（可能卡在一個很慢的請求），不等它了。")
+        if not audio_done:
+            print("音訊擷取的背景工作還沒結束，完整錄音可能還沒寫完。")
         print("已停止擷取，逐字稿已存檔。")
 
         try:
@@ -2497,6 +2514,11 @@ def main():
 
         if not raw_audio_path.exists():
             print("這次沒有按下「開始錄製」，沒有完整錄音可以拿去重新整理。")
+        elif not (worker_done and audio_done):
+            # 背景工作沒有確定結束時不要整理：可能跟還在跑的 Worker 搶同一個模型，
+            # 或讀到還沒寫完的錄音。錄音留著，之後用 --rebuild 重新整理就好
+            print(f"背景工作還沒確定結束，這次先不整理，已保留完整錄音：{raw_audio_path}")
+            print(f"之後可以用這行指令重新處理：{_rebuild_command(raw_audio_path)}")
         else:
             try:
                 notebooklm_style_path = rebuild_transcript_from_full_audio(
