@@ -1321,11 +1321,15 @@ class AudioCapture(threading.Thread):
         device: dict | None = None,
         record_path: "Path | None" = None,
         pause_state: "PauseState | None" = None,
+        on_error=None,
     ):
         super().__init__(daemon=True)
         self.utterance_queue = utterance_queue
         self.audio_ring = audio_ring
         self.pause_state = pause_state
+        # 出錯時除了印在終端機，也交給這個 callback（main() 用它在字幕列顯示警告）
+        self.on_error = on_error
+        self._stream = None
         self.pa = pyaudio.PyAudio()
         # 記住指定的裝置名稱，串流意外斷線要重連時，優先找回同一個裝置
         # （不然重連可能會抓回系統預設輸出，跟原本指定的虛擬音訊線對不上）
@@ -1436,10 +1440,51 @@ class AudioCapture(threading.Thread):
     def stop(self):
         self._stop_event.set()
 
+    def _report_error(self, message: str) -> None:
+        print(message)
+        if self.on_error is not None:
+            try:
+                self.on_error(message)
+            except Exception:
+                pass
+
     def run(self):
+        # 不管迴圈怎麼結束（正常停止、或任何沒預料到的錯誤），串流、PyAudio 和錄音檔
+        # 都一定要關掉；以前收尾放在迴圈後面，中途出錯就會被跳過，錄音檔也沒關好
+        try:
+            self._capture_loop()
+        except Exception as e:
+            self._report_error(f"音訊擷取停止了，字幕和延遲播放的聲音不會再更新：{type(e).__name__}: {e}")
+        finally:
+            if self._stream is not None:
+                try:
+                    self._stream.stop_stream()
+                    self._stream.close()
+                except Exception:
+                    pass
+            try:
+                self.pa.terminate()
+            except Exception:
+                pass
+            self._close_recording()
+
+    def _capture_loop(self):
         # 擷取用的區塊大小可以跟 VAD 窗格大小脫鉤，這裡用接近 32ms 的原生取樣數即可
         block_frames = max(1, int(self.stream_sr * VAD_CHUNK_SAMPLES / TARGET_SR))
-        stream = self._open_stream(block_frames)
+        # 第一次開啟串流也可能失敗（裝置剛好被停用、被別的程式獨占）：跟斷線重連一樣
+        # 一直重試，不要讓整條執行緒直接結束
+        open_failures = 0
+        while not self._stop_event.is_set():
+            try:
+                stream = self._stream = self._open_stream(block_frames)
+                break
+            except Exception as e:
+                open_failures += 1
+                if open_failures == 1:
+                    self._report_error(f"開啟音訊串流失敗，會持續重試：{e}")
+                time.sleep(1.0)
+        else:
+            return
 
         pending = np.empty(0, dtype=np.float32)   # 還沒湊滿一個 VAD 窗格的殘餘音訊
         utterance_frames = []
@@ -1454,6 +1499,7 @@ class AudioCapture(threading.Thread):
 
         ring_sr = self.audio_ring.sample_rate if self.audio_ring is not None else self.stream_sr
         device_missing_warned = False
+        processing_errors = 0
 
         while not self._stop_event.is_set():
             try:
@@ -1498,7 +1544,7 @@ class AudioCapture(threading.Thread):
                     self.stream_sr = int(self.device["defaultSampleRate"])
                     self.channels = self.device["maxInputChannels"]
                     block_frames = max(1, int(self.stream_sr * VAD_CHUNK_SAMPLES / TARGET_SR))
-                    stream = self._open_stream(block_frames)
+                    stream = self._stream = self._open_stream(block_frames)
                     print(f"音訊串流已重新開啟：{self.device['name']} ({self.stream_sr} Hz, {self.channels} ch)")
                     if self.stream_sr != ring_sr:
                         print(f"重新開啟後取樣率變成 {self.stream_sr} Hz，會先轉換成 {ring_sr} Hz 再延遲播放。")
@@ -1530,67 +1576,81 @@ class AudioCapture(threading.Thread):
                 captured_end = None
             was_paused = False
 
-            frames = np.frombuffer(data, dtype=np.float32).reshape(-1, max(1, self.channels))
-            # 給 Whisper / VAD / 錄音的是單聲道；給延遲播放的保留原本的聲道數（立體聲）
-            audio = frames.mean(axis=1) if frames.shape[1] > 1 else frames[:, 0]
+            # 這一段的處理（轉換取樣率、寫錄音、VAD）出錯時，跳過這一段繼續擷取，
+            # 不要讓整條執行緒結束——以前這裡出錯，字幕和錄音就默默停了
+            try:
+                frames = np.frombuffer(data, dtype=np.float32).reshape(-1, max(1, self.channels))
+                # 給 Whisper / VAD / 錄音的是單聲道；給延遲播放的保留原本的聲道數（立體聲）
+                audio = frames.mean(axis=1) if frames.shape[1] > 1 else frames[:, 0]
 
-            if self.audio_ring is not None:
-                # 存原始擷取取樣率的音訊給延遲播放用，不要存降到 16kHz 之後的版本——
-                # resample_linear 是單純線性內插、沒有做降頻前該有的抗鋸齒濾波，
-                # 拿去餵 Whisper 沒差，但直接播給人聽會多一層可聽見的雜訊/悶悶的感覺。
-                ring_frames = frames
-                if self.stream_sr != ring_sr:
-                    # 重連後取樣率變了（很少見）：先轉成緩衝區原本的取樣率，不然聲音速度和音高會錯
-                    ring_frames = resample_high_quality(frames, self.stream_sr, ring_sr)
-                    captured_end = None
-                self.audio_ring.write(ring_frames, captured_end=captured_end)
+                if self.audio_ring is not None:
+                    # 存原始擷取取樣率的音訊給延遲播放用，不要存降到 16kHz 之後的版本——
+                    # resample_linear 是單純線性內插、沒有做降頻前該有的抗鋸齒濾波，
+                    # 拿去餵 Whisper 沒差，但直接播給人聽會多一層可聽見的雜訊/悶悶的感覺。
+                    ring_frames = frames
+                    if self.stream_sr != ring_sr:
+                        # 重連後取樣率變了（很少見）：先轉成緩衝區原本的取樣率，不然聲音速度和音高會錯
+                        ring_frames = resample_high_quality(frames, self.stream_sr, ring_sr)
+                        captured_end = None
+                    self.audio_ring.write(ring_frames, captured_end=captured_end)
 
-            audio_16k = resample_linear(audio, self.stream_sr, TARGET_SR)
+                audio_16k = resample_linear(audio, self.stream_sr, TARGET_SR)
 
-            self._write_recording(audio_16k)
+                self._write_recording(audio_16k)
 
-            pending = np.concatenate([pending, audio_16k])
+                pending = np.concatenate([pending, audio_16k])
 
-            # 用固定窗格大小餵給 Silero VAD，累積出一句一句的語音
-            while len(pending) >= VAD_CHUNK_SAMPLES:
-                chunk = pending[:VAD_CHUNK_SAMPLES]
-                pending = pending[VAD_CHUNK_SAMPLES:]
+                # 用固定窗格大小餵給 Silero VAD，累積出一句一句的語音
+                while len(pending) >= VAD_CHUNK_SAMPLES:
+                    chunk = pending[:VAD_CHUNK_SAMPLES]
+                    pending = pending[VAD_CHUNK_SAMPLES:]
 
-                chunk_ms = VAD_CHUNK_SAMPLES / TARGET_SR * 1000
-                event = self.vad_iterator(torch.from_numpy(chunk), return_seconds=False)
+                    chunk_ms = VAD_CHUNK_SAMPLES / TARGET_SR * 1000
+                    event = self.vad_iterator(torch.from_numpy(chunk), return_seconds=False)
 
-                if event is not None and "start" in event:
-                    speech_active = True
-                    utterance_frames = []
-                    utterance_ms = 0
-                    utterance_start_time = time.time()
-
-                if speech_active:
-                    utterance_frames.append(chunk)
-                    utterance_ms += chunk_ms
-
-                force_flush = utterance_ms / 1000 >= MAX_UTTERANCE_SEC
-                is_end = event is not None and "end" in event
-
-                if speech_active and (is_end or force_flush):
-                    utterance = np.concatenate(utterance_frames)
-                    # 記下這句話「開口講的那一刻」，不是「講完的那一刻」——字幕要對上
-                    # 延遲畫面裡這個人開口的瞬間，用開始時間才對；如果用講完的時間去加
-                    # DISPLAY_DELAY_SEC，長句子（例如講滿 10 秒才被強制切斷）算出來的
-                    # release_at 會剛好等於延遲畫面「整句話已經播完」的那一刻，變成要等
-                    # 聽完一整句才看到字幕，完全喪失延遲緩衝原本要爭取的時間。
-                    self.utterance_queue.put((utterance, utterance_start_time or time.time()))
-                    utterance_frames = []
-                    utterance_ms = 0
-                    speech_active = not is_end  # 強制切斷後若還在講話，繼續累積下一段
-                    if speech_active:
-                        # 被迫切斷但這個人還在講、還沒停頓，剩下這段話就從「現在」這一刻算起
+                    if event is not None and "start" in event:
+                        speech_active = True
+                        utterance_frames = []
+                        utterance_ms = 0
                         utterance_start_time = time.time()
 
-        stream.stop_stream()
-        stream.close()
-        self.pa.terminate()
-        self._close_recording()
+                    if speech_active:
+                        utterance_frames.append(chunk)
+                        utterance_ms += chunk_ms
+
+                    force_flush = utterance_ms / 1000 >= MAX_UTTERANCE_SEC
+                    is_end = event is not None and "end" in event
+
+                    if speech_active and (is_end or force_flush):
+                        utterance = np.concatenate(utterance_frames)
+                        # 記下這句話「開口講的那一刻」，不是「講完的那一刻」——字幕要對上
+                        # 延遲畫面裡這個人開口的瞬間，用開始時間才對；如果用講完的時間去加
+                        # DISPLAY_DELAY_SEC，長句子（例如講滿 10 秒才被強制切斷）算出來的
+                        # release_at 會剛好等於延遲畫面「整句話已經播完」的那一刻，變成要等
+                        # 聽完一整句才看到字幕，完全喪失延遲緩衝原本要爭取的時間。
+                        self.utterance_queue.put((utterance, utterance_start_time or time.time()))
+                        utterance_frames = []
+                        utterance_ms = 0
+                        speech_active = not is_end  # 強制切斷後若還在講話，繼續累積下一段
+                        if speech_active:
+                            # 被迫切斷但這個人還在講、還沒停頓，剩下這段話就從「現在」這一刻算起
+                            utterance_start_time = time.time()
+
+            except Exception as e:
+                processing_errors += 1
+                if processing_errors == 1 or processing_errors % 50 == 0:
+                    self._report_error(
+                        f"處理音訊時發生錯誤（第 {processing_errors} 次），先跳過這一段：{type(e).__name__}: {e}"
+                    )
+                # 狀態可能已經不一致：丟掉還沒講完的句子，VAD 重新開始
+                speech_active = False
+                utterance_frames = []
+                utterance_ms = 0
+                pending = np.empty(0, dtype=np.float32)
+                try:
+                    self.vad_iterator.reset_states()
+                except Exception:
+                    pass
 
 
 _SYSTEM_PROMPT_BASE = (
@@ -2387,6 +2447,7 @@ def main():
     audio_capture = AudioCapture(
         utterance_queue, audio_ring=audio_ring, device=input_device,
         record_path=raw_audio_path, pause_state=pause_state,
+        on_error=lambda message: caption_queue.put((time.time(), "⚠ 音訊擷取發生錯誤（詳見終端機）", message)),
     )
     worker = Worker(
         utterance_queue, caption_queue, transcript_queue, episode_title,

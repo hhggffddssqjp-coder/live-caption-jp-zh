@@ -643,6 +643,64 @@ class RecordingTests(TranslationBackendTestCase):
 		capture._wav_lock = __import__("threading").Lock()
 		return capture
 
+	def make_running_capture(self, open_results):
+		"""An AudioCapture wired to fakes: _open_stream returns/raises open_results in order."""
+		import threading
+		capture = self.make_capture(None)
+		capture._stop_event = threading.Event()
+		capture._stream = None
+		capture.pa = mock.Mock()
+		capture.on_error = mock.Mock()
+		capture.stream_sr = 48000
+		capture.channels = 2
+		capture.device = {"name": "CABLE Input (VB-Audio Virtual Cable) [Loopback]"}
+		capture._preferred_name = capture.device["name"]
+		capture.audio_ring = None
+		capture.pause_state = None
+		capture.vad_iterator = mock.Mock()
+		capture._open_stream = mock.Mock(side_effect=open_results)
+		return capture
+
+	def test_run_always_cleans_up_and_reports_when_the_loop_crashes(self):
+		capture = self.make_running_capture([])
+		stream = mock.Mock()
+		capture._stream = stream
+		capture._capture_loop = mock.Mock(side_effect=RuntimeError("boom"))
+		with mock.patch("builtins.print"):
+			capture.run()
+		stream.close.assert_called_once_with()
+		capture.pa.terminate.assert_called_once_with()
+		self.assertIn("音訊擷取停止了", capture.on_error.call_args.args[0])
+
+	def test_first_open_failure_is_retried_and_a_bad_block_does_not_end_the_thread(self):
+		stream = mock.Mock()
+		reads = []
+
+		def read(frames, exception_on_overflow=False):
+			reads.append(frames)
+			if len(reads) >= 2:
+				capture._stop_event.set()
+			return b"\x00\x00\x00\x00" * 2 * frames
+
+		stream.read.side_effect = read
+		capture = self.make_running_capture([OSError("device busy"), stream])
+		# numpy is stubbed in this module; this stand-in only supports what the loop needs, and
+		# its frombuffer raises: that is the "processing one block failed" case, after which the
+		# loop must keep reading
+		fake_np = types.SimpleNamespace(
+			empty=lambda *a, **k: [], float32="float32",
+			frombuffer=mock.Mock(side_effect=ValueError("bad block")),
+		)
+		with mock.patch.object(self.app.time, "sleep"), mock.patch("builtins.print"), \
+				mock.patch.object(self.app, "np", fake_np):
+			capture.run()
+		self.assertEqual(capture._open_stream.call_count, 2)       # retried after the first failure
+		self.assertEqual(len(reads), 2)                            # kept reading after the bad block
+		messages = [call.args[0] for call in capture.on_error.call_args_list]
+		self.assertTrue(any("開啟音訊串流失敗" in m for m in messages))
+		self.assertTrue(any("處理音訊時發生錯誤" in m for m in messages))
+		stream.close.assert_called_once_with()                     # cleaned up by run()'s finally
+
 	def test_stop_then_start_again_appends_instead_of_overwriting(self):
 		import wave
 		fake_np = types.SimpleNamespace(clip=lambda x, *_: x, int16="int16")
