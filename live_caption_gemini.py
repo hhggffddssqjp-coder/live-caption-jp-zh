@@ -1025,7 +1025,7 @@ class FrameBuffer:
 
     def get_at(self, target_ts: float):
         with self.lock:
-            if not self.frames:
+            if not self.frames or target_ts < self.frames[0][0]:
                 return None
             best = self.frames[0][1]
             for ts, image in self.frames:
@@ -1034,6 +1034,13 @@ class FrameBuffer:
                 else:
                     break
             return best
+
+    def buffering_seconds(self, target_ts: float):
+        """最舊影格還要等幾秒才到播放時間；尚未收到影格時無法估計。"""
+        with self.lock:
+            if not self.frames:
+                return None
+            return max(0.0, self.frames[0][0] - target_ts)
 
     def perf_snapshot(self):
         """每秒由紀錄執行緒取樣，關閉紀錄時不會呼叫。"""
@@ -2156,6 +2163,8 @@ class PlayerWindow:
             return
         now_paused = self.pause_state.toggle()
         self.pause_btn.config(text="▶ 繼續" if now_paused else "⏸ 暫停")
+        if not now_paused:
+            self.canvas.delete("pause_overlay")
         print("已暫停擷取/辨識/翻譯/播放。" if now_paused else "已繼續。")
 
     def _on_toggle_recording(self):
@@ -2267,8 +2276,11 @@ class PlayerWindow:
             self._image_item = None
             self._photo_size = None
             self._last_frame = None
+            self._photo = None
+            remaining = self.frame_buffer.buffering_seconds(target_time)
+            buffering_text = f"緩衝中... 還要 {math.ceil(remaining)} 秒" if remaining else "緩衝中..."
             self.canvas.create_text(
-                cw // 2, ch // 2, text="緩衝中...", fill="white",
+                cw // 2, ch // 2, text=buffering_text, fill="white",
                 font=("Microsoft JhengHei", 16),
             )
 
