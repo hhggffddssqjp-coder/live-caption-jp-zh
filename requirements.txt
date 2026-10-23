@@ -20,3 +20,7 @@ scipy
 # Gemini 版 / 啟動器用
 google-genai
 psutil
+
+# HTTPS 憑證清單：2026.10.19 起移除了 eMudhra emSign 事件中有問題的 emSign ECC Root CA - G3
+# （google-genai 透過 httpx 使用這份清單；舊版會信任可能被偽造的憑證）
+certifi>=2026.10.19
