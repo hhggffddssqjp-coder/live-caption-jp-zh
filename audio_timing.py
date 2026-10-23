@@ -198,3 +198,63 @@ class PlaybackDriftTracker:
             return 0.0
         # 聽到的時間點落後（drift < 0）就往前跳；超前就往回退
         return -drift
+
+
+class EnergySpeechGate:
+    """用音量（RMS）判斷「有沒有人在講話」，給氣音／ASMR 用，取代 Silero VAD。
+
+    Silero VAD 是用一般講話的聲音訓練的，氣音沒有聲帶振動，它幾乎認不出來：實測一段
+    355 秒的 ASMR 錄音，語音機率超過 0.5 的時間只有 0.2%（門檻降到 0.15 也只有 0.6%），
+    字幕幾乎全部出不來。這裡改成只看音量：超過門檻就算有人在講話，連續安靜超過
+    silence_end_ms 才算一句講完。代價是任何夠大的聲音都會被當成講話（背景音樂、
+    環境音），所以只適合安靜的 ASMR 這類內容，一般節目還是用 Silero VAD。
+
+    介面跟 silero_vad.VADIterator 一樣：呼叫時傳入一個 16kHz 的窗格，句子開始回傳
+    {"start": 樣本位置}、結束回傳 {"end": 樣本位置}，其他時候回傳 None。
+    """
+
+    def __init__(self, rms_threshold: float, silence_end_ms: float, sample_rate: int = 16000):
+        # 門檻用 16 位元整數的音量單位（最大 32768），跟一般音訊工具顯示的 RMS 一樣；
+        # 例如 60 大約是 -55 dBFS
+        self.rms_threshold = float(rms_threshold)
+        self.silence_end_ms = float(silence_end_ms)
+        self.sample_rate = sample_rate
+        self.reset_states()
+
+    def reset_states(self) -> None:
+        self._speaking = False
+        self._silence_ms = 0.0
+        self._position = 0  # 目前處理到第幾個樣本
+
+    @staticmethod
+    def rms_int16(chunk) -> float:
+        samples = np.asarray(chunk, dtype=np.float32)
+        if samples.size == 0:
+            return 0.0
+        return float(np.sqrt(np.mean(samples ** 2)) * 32768.0)
+
+    def __call__(self, chunk, return_seconds: bool = False):
+        samples = np.asarray(chunk, dtype=np.float32)
+        chunk_ms = len(samples) / self.sample_rate * 1000.0
+        start_of_chunk = self._position
+        self._position += len(samples)
+        loud = self.rms_int16(samples) > self.rms_threshold
+
+        def at(position):
+            return position / self.sample_rate if return_seconds else position
+
+        if not self._speaking:
+            if loud:
+                self._speaking = True
+                self._silence_ms = 0.0
+                return {"start": at(start_of_chunk)}
+            return None
+        if loud:
+            self._silence_ms = 0.0
+            return None
+        self._silence_ms += chunk_ms
+        if self._silence_ms >= self.silence_end_ms:
+            self._speaking = False
+            self._silence_ms = 0.0
+            return {"end": at(self._position)}
+        return None
