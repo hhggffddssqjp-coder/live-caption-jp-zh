@@ -221,6 +221,11 @@ VAD_SPEECH_PAD_MS = 100           # 語句前後多保留一點音訊，避免�
 ASMR_MODE = os.environ.get("CAPTION_VAD", "").strip().lower() in ("asmr", "energy")
 ASMR_RMS_THRESHOLD = _env_seconds("ASMR_RMS_THRESHOLD", 60.0)  # 讀正數的工具函式，單位不是秒
 
+# 只攔下「幾乎整段都沒辨識到」的整理稿，避免一般直播的音樂、聊天空檔也觸發。
+# 至少錄滿兩分鐘，且辨識出的語音不到整段的 10%，才保留錄音供重新處理。
+REBUILD_SPARSE_MIN_RECORDING_SEC = 120.0
+REBUILD_SPARSE_SPEECH_RATIO = 0.10
+
 # 這兩個值故意拉長：日文常有動詞放句尾、句中助詞換氣停頓的狀況，
 # 停頓門檻太短會把一句話切成兩半，導致辨識/翻譯失去前後文法脈絡。
 # 有 GPU 加速運算很快，多等一點點換取整句完整度是划算的。
@@ -624,6 +629,16 @@ def _rebuild_is_complete(missing: int, placeholders: int, problems: int, total: 
     return placeholders == 0 and missing <= allowance and problems <= allowance
 
 
+def _rebuild_speech_too_sparse(speech_sec: float, recording_sec: float | None) -> bool:
+    """長錄音只辨識到極少語音時保留原檔；不知道錄音長度就不做這項檢查。"""
+    return (
+        recording_sec is not None
+        and math.isfinite(recording_sec)
+        and recording_sec >= REBUILD_SPARSE_MIN_RECORDING_SEC
+        and speech_sec < recording_sec * REBUILD_SPARSE_SPEECH_RATIO
+    )
+
+
 def rebuild_transcript_from_full_audio(
     wav_path: "Path",
     asr_model: "WhisperModel",
@@ -655,15 +670,26 @@ def rebuild_transcript_from_full_audio(
     )
 
     ja_lines = []
+    speech_sec = 0.0
     for seg in segments:
         text = seg.text.strip()
         if not text or text in _HALLUCINATION_DENYLIST:
             continue
         ja_lines.append(text)
+        speech_sec += seg.end - seg.start
 
     if not ja_lines:
         print("完整錄音重新辨識沒有偵測到內容，略過這份整理稿。")
         return None
+
+    recording_sec = None
+    try:
+        with wave.open(str(wav_path), "rb") as recording:
+            recording_sec = recording.getnframes() / recording.getframerate()
+    except (OSError, EOFError, wave.Error):
+        # 長度讀不到就略過這項檢查，仍照原本的句數與翻譯品質判斷。
+        pass
+    sparse_speech = _rebuild_speech_too_sparse(speech_sec, recording_sec)
 
     print(f"重新辨識完成，共 {len(ja_lines)} 句，正在請翻譯模型分批整理成完整逐字稿...")
 
@@ -701,7 +727,7 @@ def rebuild_transcript_from_full_audio(
             "準確度會比即時觀看時看到的字幕更好，內容照實呈現、沒有自己刪減。"
         )
     missing, placeholders, problems = _rebuild_coverage(polished_parts, ja_lines, glossary)
-    complete = _rebuild_is_complete(missing, placeholders, problems, len(ja_lines))
+    complete = _rebuild_is_complete(missing, placeholders, problems, len(ja_lines)) and not sparse_speech
     keep_recording = bool(failed_batches) or not complete
     if keep_recording:
         reasons = []
@@ -713,6 +739,11 @@ def rebuild_transcript_from_full_audio(
             reasons.append(f"{placeholders} 句翻譯失敗")
         if problems:
             reasons.append(f"{problems} 句翻譯可能有問題")
+        if sparse_speech:
+            reasons.append(
+                f"辨識出的語音只有 {speech_sec / 60:.1f} 分鐘，錄音有 {recording_sec / 60:.1f} 分鐘，"
+                "可能有很小聲或氣音的段落沒聽到；可以用氣音模式重新處理"
+            )
         # 整理稿是拿來讀、分享的，不放絕對路徑（裡面有 Windows 使用者資料夾名稱）
         summary += (
             f"\n\n⚠️ 這份整理稿可能有缺漏（{'、'.join(reasons)}，共 {len(ja_lines)} 句）；"
@@ -735,8 +766,7 @@ def rebuild_transcript_from_full_audio(
     # 用完就刪掉，不用留著佔硬碟空間——但只要整理稿可能有缺漏，就保留錄音，
     # 不然缺漏的內容就永遠找不回來了
     if keep_recording:
-        print(f"整理稿可能有缺漏（失敗批數 {failed_batches}、少 {missing} 句、翻譯失敗 {placeholders} 句、"
-              f"可能有問題 {problems} 句，共 {len(ja_lines)} 句），已保留完整錄音：{wav_path}")
+        print(f"整理稿可能有缺漏（{'、'.join(reasons)}，共 {len(ja_lines)} 句），已保留完整錄音：{wav_path}")
         print(f"之後可以用這行指令重新處理：{_rebuild_command(wav_path)}")
         return out_path
     try:

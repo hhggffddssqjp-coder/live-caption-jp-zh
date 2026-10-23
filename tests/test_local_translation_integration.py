@@ -12,6 +12,7 @@ import sys
 import tempfile
 import types
 import unittest
+import wave
 from pathlib import Path
 from unittest import mock
 
@@ -374,6 +375,94 @@ class GeminiPathTests(TranslationBackendTestCase):
 		self.assertFalse(self.app._rebuild_is_complete(missing=0, placeholders=0, problems=4, total=60))
 		self.assertTrue(self.app._rebuild_is_complete(missing=1, placeholders=0, problems=1, total=5))
 
+
+
+class SparseRebuildSpeechTests(TranslationBackendTestCase):
+	"""辨識到的語音幾乎是空白時，不能刪掉唯一的錄音。"""
+
+	def test_short_recording_does_not_trigger(self):
+		for duration in (0.0, 60.0, 119.99):
+			with self.subTest(duration=duration):
+				self.assertFalse(self.app._rebuild_speech_too_sparse(0.0, duration))
+
+	def test_minimum_recording_duration_is_inclusive(self):
+		self.assertTrue(self.app._rebuild_speech_too_sparse(0.0, 120.0))
+
+	def test_speech_ratio_must_be_strictly_below_ten_percent(self):
+		self.assertTrue(self.app._rebuild_speech_too_sparse(11.99, 120.0))
+		self.assertFalse(self.app._rebuild_speech_too_sparse(12.0, 120.0))
+		self.assertFalse(self.app._rebuild_speech_too_sparse(12.01, 120.0))
+
+	def test_unknown_recording_duration_does_not_trigger(self):
+		for duration in (None, float("nan"), float("inf")):
+			with self.subTest(duration=duration):
+				self.assertFalse(self.app._rebuild_speech_too_sparse(0.0, duration))
+
+	def run_wav_reconstruction(self, segments, duration=180.0, asmr=False, read_error=None):
+		# 使用真正的 WAV 標頭，不依賴被換成假模組的 numpy、torch 或 Google 套件。
+		temp_dir = tempfile.TemporaryDirectory()
+		self.addCleanup(temp_dir.cleanup)
+		wav_path = Path(temp_dir.name) / "transcript_20261023_010203_audio.wav"
+		with wave.open(str(wav_path), "wb") as recording:
+			recording.setnchannels(1)
+			recording.setsampwidth(2)
+			recording.setframerate(16000)
+			recording.writeframes(b"\0\0" * int(duration * 16000))
+		asr = mock.Mock()
+		asr.transcribe.return_value = (iter(segments), None)
+		translator, calls = self.gemini_translator(lambda contents, n: bilingual_reply(contents, "中文"))
+		with mock.patch.object(self.app, "ASMR_MODE", asmr):
+			if read_error is None:
+				out_path = self.app.rebuild_transcript_from_full_audio(wav_path, asr, translator, None)
+			else:
+				with mock.patch.object(self.app.wave, "open", side_effect=read_error):
+					out_path = self.app.rebuild_transcript_from_full_audio(wav_path, asr, translator, None)
+		self.assertEqual(asr.transcribe.call_args.kwargs["vad_filter"], not asmr)
+		return out_path, wav_path, calls
+
+	def test_sparse_speech_keeps_recording_and_explains_how_to_retry(self):
+		for asmr in (False, True):
+			with self.subTest(asmr=asmr):
+				out_path, wav_path, _ = self.run_wav_reconstruction([FakeSegment(0)], asmr=asmr)
+				self.assertTrue(wav_path.exists())
+				text = out_path.read_text(encoding="utf-8")
+				self.assertIn("辨識出的語音只有 0.0 分鐘，錄音有 3.0 分鐘", text)
+				self.assertIn("可以用氣音模式重新處理", text)
+				self.assertIn("--rebuild", text)
+				self.assertNotIn(str(wav_path.parent), text)
+				self.assertIn("可以用氣音模式重新處理", self.printed_text())
+				self.assertIn(self.app._rebuild_command(wav_path), self.printed_text())
+
+	def test_normal_speech_deletes_recording_even_with_long_pauses(self):
+		# 只講了整段約 13%，仍算正常；加總兩句才會超過門檻。
+		segments = [FakeSegment(0), FakeSegment(1)]
+		segments[0].start, segments[0].end = 30.0, 42.0
+		segments[1].start, segments[1].end = 130.0, 142.0
+		out_path, wav_path, _ = self.run_wav_reconstruction(segments)
+		self.assertTrue(out_path.exists())
+		self.assertFalse(wav_path.exists())
+		self.assertNotIn("這份整理稿可能有缺漏", out_path.read_text(encoding="utf-8"))
+
+	def test_filtered_segments_do_not_count_as_recognized_speech(self):
+		segments = [FakeSegment(0), FakeSegment(1, ""), FakeSegment(2, next(iter(self.app._HALLUCINATION_DENYLIST)))]
+		for segment in segments[1:]:
+			segment.start, segment.end = 10.0, 100.0
+		out_path, wav_path, _ = self.run_wav_reconstruction(segments)
+		self.assertTrue(wav_path.exists())
+		self.assertIn("辨識出的語音只有 0.0 分鐘", out_path.read_text(encoding="utf-8"))
+
+	def test_no_recognized_lines_keeps_recording_without_translation(self):
+		out_path, wav_path, calls = self.run_wav_reconstruction([FakeSegment(0, "")])
+		self.assertIsNone(out_path)
+		self.assertTrue(wav_path.exists())
+		self.assertEqual(len(calls), 0)
+
+	def test_unreadable_duration_uses_existing_completeness_checks(self):
+		for error in (OSError("無法讀取"), EOFError(), wave.Error("不完整的 WAV")):
+			with self.subTest(error=type(error).__name__):
+				out_path, wav_path, _ = self.run_wav_reconstruction([FakeSegment(0)], read_error=error)
+				self.assertTrue(out_path.exists())
+				self.assertFalse(wav_path.exists())
 
 
 class PromptParityTests(TranslationBackendTestCase):
