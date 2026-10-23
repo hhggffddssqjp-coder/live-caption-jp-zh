@@ -212,6 +212,7 @@ llama-server -m 你的模型.gguf --host 127.0.0.1 --port 8766 -c 8192 -np 1 -ng
 | --- | --- | --- |
 | `TRANSLATION_BACKEND` | 上次的選擇，否則 `gemini` | `gemini` 或 `local` |
 | `WHISPER_MODEL` | GPU `large-v3`、CPU `small` | 語音辨識模型，例如 `large-v3-turbo`、`medium` |
+| `CAPTION_PERF_LOG` | 關閉 | 設為 `1`，每秒寫入 `logs/perf_caption_<開始時間>.csv`，量測畫面卡頓、GC、記憶體與系統負載；結束時會寫完最後一筆 |
 | `GEMINI_API_KEY` | 讀 `gemini_api_key.txt` | Gemini 金鑰 |
 | `GEMINI_LIVE_TIMEOUT` | `15` | Gemini 即時字幕單句的逾時秒數，超過就跳過那一句 |
 | `GEMINI_BATCH_TIMEOUT` | `120` | Gemini 事後整理每一批的逾時秒數 |

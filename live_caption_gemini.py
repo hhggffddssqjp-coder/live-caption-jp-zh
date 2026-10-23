@@ -124,6 +124,16 @@ from local_translation import (
 )
 from llama_server import LlamaServerError, ensure_llama_server
 
+_perf_stats = None
+
+
+def _start_perf_log(frame_buffer):
+    # 關閉時不載入效能模組，也不建立檔案、鎖、GC callback 或背景執行緒。
+    if os.environ.get("CAPTION_PERF_LOG") != "1":
+        return None
+    from perf_stats import PerfStats
+    return PerfStats(frame_buffer)
+
 # The Gemini SDK is imported only when the Gemini backend is chosen, so local-model
 # users do not need google-genai installed.
 genai = None
@@ -1015,7 +1025,7 @@ class FrameBuffer:
 
     def get_at(self, target_ts: float):
         with self.lock:
-            if not self.frames:
+            if not self.frames or target_ts < self.frames[0][0]:
                 return None
             best = self.frames[0][1]
             for ts, image in self.frames:
@@ -1024,6 +1034,21 @@ class FrameBuffer:
                 else:
                     break
             return best
+
+    def buffering_seconds(self, target_ts: float):
+        """最舊影格還要等幾秒才到播放時間；尚未收到影格時無法估計。"""
+        with self.lock:
+            if not self.frames:
+                return None
+            return max(0.0, self.frames[0][0] - target_ts)
+
+    def perf_snapshot(self):
+        """每秒由紀錄執行緒取樣，關閉紀錄時不會呼叫。"""
+        with self.lock:
+            return (
+                len(self.frames), sum(image.nbytes for _, image in self.frames),
+                self.frames[-1][0] - self.frames[0][0] if self.frames else 0.0,
+            )
 
 
 class ScreenCapture:
@@ -1105,6 +1130,7 @@ class ScreenCapture:
         self._receiver_thread.start()
 
     def _receive_loop(self):
+        perf = _perf_stats
         last_seen = -1
         while not self._receiver_stop.is_set():
             # 把主行程這邊的暫停旗標同步給擷取行程，按暫停時畫面擷取才會一起停
@@ -1125,8 +1151,12 @@ class ScreenCapture:
             w = int(self._meta[idx + 1])
             ts = self._meta[idx + 2]
             nbytes = h * w * 3
+            if perf is not None:
+                copy_started = time.perf_counter()
             frame = self._shm_view[slot, :nbytes].reshape(h, w, 3).copy()
             self.frame_buffer.push(ts, frame)
+            if perf is not None:
+                perf.timing("receive_copy_push", (time.perf_counter() - copy_started) * 1000)
 
     def switch_window(self, hwnd: int):
         """切換擷取目標到另一個視窗，執行中隨時可以呼叫，下一次擷取就會生效"""
@@ -1970,20 +2000,28 @@ class Worker(threading.Thread):
 
     def _process_utterance(self, audio, capture_time: float) -> None:
         """辨識 + 翻譯一句話，結果送進字幕列、逐字稿面板，並寫入逐字稿檔"""
-        segments, _ = self.asr.transcribe(
-            audio,
-            language="ja",
-            vad_filter=False,
-            beam_size=WHISPER_BEAM_SIZE,
-            condition_on_previous_text=False,  # 避免長時間播放時的重複幻覺
-            # Whisper 原生規則：「沒人說話機率 > 0.6」而且「平均信心 < -1.0」才當成
-            # 沒人講話丟掉。不要再自己加「no_speech_prob > 0.6 就整句丟」——large-v3
-            # 遇到背景音樂常給真正的人聲 0.6~0.9 的 no_speech_prob，實測 74 句裡有
-            # 13 句清楚的人聲被這樣誤丟（信心都在 -0.5 以上，turbo 也辨識出一樣的內容）
-            no_speech_threshold=0.6,
-            log_prob_threshold=-1.0,
-        )
-        segments = list(segments)
+        perf = _perf_stats
+        if perf is not None:
+            perf.activity("asr", True)
+        try:
+            segments, _ = self.asr.transcribe(
+                audio,
+                language="ja",
+                vad_filter=False,
+                beam_size=WHISPER_BEAM_SIZE,
+                condition_on_previous_text=False,  # 避免長時間播放時的重複幻覺
+                # Whisper 原生規則：「沒人說話機率 > 0.6」而且「平均信心 < -1.0」才當成
+                # 沒人講話丟掉。不要再自己加「no_speech_prob > 0.6 就整句丟」——large-v3
+                # 遇到背景音樂常給真正的人聲 0.6~0.9 的 no_speech_prob，實測 74 句裡有
+                # 13 句清楚的人聲被這樣誤丟（信心都在 -0.5 以上，turbo 也辨識出一樣的內容）
+                no_speech_threshold=0.6,
+                log_prob_threshold=-1.0,
+            )
+            # Whisper 真正的辨識工作包含惰性產生的 segments。
+            segments = list(segments)
+        finally:
+            if perf is not None:
+                perf.activity("asr", False)
         ja_text = "".join(seg.text for seg in segments).strip()
         if not ja_text or ja_text in _HALLUCINATION_DENYLIST:
             return
@@ -2014,7 +2052,13 @@ class Worker(threading.Thread):
         # 逐字稿面板、畫面下方字幕列都用同一份結果，不用多算一次
         # （字幕列以前會把最近幾句接起來整段重翻，除了拖慢速度，塞太多字
         # 也會把固定高度的字幕區撐爆，所以改成只顯示當下這一句就好）
-        zh_final = self.translator.translate_with_context(self.prev_ja, ja_text, self.glossary)
+        if perf is not None:
+            perf.activity("translation", True)
+        try:
+            zh_final = self.translator.translate_with_context(self.prev_ja, ja_text, self.glossary)
+        finally:
+            if perf is not None:
+                perf.activity("translation", False)
         self.prev_ja = ja_text
         self.transcript_queue.put((release_at, ja_text, zh_final))
         self.caption_queue.put((release_at, ja_text, zh_final))
@@ -2119,6 +2163,8 @@ class PlayerWindow:
             return
         now_paused = self.pause_state.toggle()
         self.pause_btn.config(text="▶ 繼續" if now_paused else "⏸ 暫停")
+        if not now_paused:
+            self.canvas.delete("pause_overlay")
         print("已暫停擷取/辨識/翻譯/播放。" if now_paused else "已繼續。")
 
     def _on_toggle_recording(self):
@@ -2159,7 +2205,10 @@ class PlayerWindow:
         print(f"已切換擷取視窗：{chosen.title}")
 
     def _poll_video(self):
+        perf = _perf_stats
         started = time.perf_counter()
+        if perf is not None:
+            perf.poll_started(started)
         is_paused = self.pause_state is not None and self.pause_state.is_paused()
         if is_paused:
             # 暫停中：畫面就停在最後一格不動，只在上面疊一個「已暫停」的字，
@@ -2173,10 +2222,16 @@ class PlayerWindow:
                     font=("Microsoft JhengHei", 28, "bold"), tags="pause_overlay",
                 )
             self.root.after(1000 // CAPTURE_TARGET_FPS, self._poll_video)
+            if perf is not None:
+                perf.timing("poll", (time.perf_counter() - started) * 1000)
             return
 
         target_time = time.time() - DISPLAY_DELAY_SEC
+        if perf is not None:
+            get_started = time.perf_counter()
         frame = self.frame_buffer.get_at(target_time)
+        if perf is not None:
+            perf.timing("get_at", (time.perf_counter() - get_started) * 1000)
         cw = self.canvas.winfo_width()
         ch = self.canvas.winfo_height()
 
@@ -2187,12 +2242,20 @@ class PlayerWindow:
             size_changed = (new_w, new_h) != self._photo_size
             if frame is not self._last_frame or size_changed:
                 # 用 cv2 縮放，比 PIL 的 resize 快很多，減少畫面更新這一步造成的掉幀
+                if perf is not None:
+                    resize_started = time.perf_counter()
                 resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+                if perf is not None:
+                    perf.timing("resize", (time.perf_counter() - resize_started) * 1000)
                 if size_changed or self._image_item is None:
                     # 視窗大小變了才重建圖片；平常每一格都只 paste 進同一張圖，
                     # 省掉每格「新建 PhotoImage + 刪掉重畫畫布」的成本（實測約快一倍）
                     self.canvas.delete("all")
+                    if perf is not None:
+                        photo_started = time.perf_counter()
                     self._photo = ImageTk.PhotoImage(Image.fromarray(resized))
+                    if perf is not None:
+                        perf.timing("photo", (time.perf_counter() - photo_started) * 1000)
                     self._image_item = self.canvas.create_image(
                         cw // 2, ch // 2, image=self._photo, anchor="center"
                     )
@@ -2200,15 +2263,24 @@ class PlayerWindow:
                 else:
                     self.canvas.delete("pause_overlay")
                     self.canvas.coords(self._image_item, cw // 2, ch // 2)
+                    if perf is not None:
+                        photo_started = time.perf_counter()
                     self._photo.paste(Image.fromarray(resized))
+                    if perf is not None:
+                        perf.timing("photo", (time.perf_counter() - photo_started) * 1000)
                 self._last_frame = frame
+                if perf is not None:
+                    perf.painted()
         elif cw > 10 and ch > 10:
             self.canvas.delete("all")
             self._image_item = None
             self._photo_size = None
             self._last_frame = None
+            self._photo = None
+            remaining = self.frame_buffer.buffering_seconds(target_time)
+            buffering_text = f"緩衝中... 還要 {math.ceil(remaining)} 秒" if remaining else "緩衝中..."
             self.canvas.create_text(
-                cw // 2, ch // 2, text="緩衝中...", fill="white",
+                cw // 2, ch // 2, text=buffering_text, fill="white",
                 font=("Microsoft JhengHei", 16),
             )
 
@@ -2216,6 +2288,8 @@ class PlayerWindow:
         # 等待」疊起來，實際更新率會掉到目標的一半左右
         elapsed_ms = (time.perf_counter() - started) * 1000
         self.root.after(max(1, int(1000 / CAPTURE_TARGET_FPS - elapsed_ms)), self._poll_video)
+        if perf is not None:
+            perf.timing("poll", (time.perf_counter() - started) * 1000)
 
     def _poll_captions(self):
         try:
@@ -2316,7 +2390,7 @@ OUTPUT_DEFAULT_LABEL = "系統預設（可能會有回音問題）"
 
 
 def main():
-    global DISPLAY_DELAY_SEC
+    global DISPLAY_DELAY_SEC, _perf_stats
 
     print("=== 即時中日對照字幕（Gemini API / 本機語言模型） ===")
 
@@ -2520,6 +2594,7 @@ def main():
     # 之後想要的話可以自己在這裡重新呼叫）
 
     try:
+        _perf_stats = _start_perf_log(frame_buffer)
         screen_capture.start()
         audio_capture.start()
         audio_player.start()
@@ -2582,6 +2657,9 @@ def main():
         # 完整錄音的 WAV 檔要等 AudioCapture 執行緒真的跑完、把檔案關閉寫入磁碟，
         # 才能安全地拿去重新辨識——不然可能讀到還沒寫完、不完整的檔案
         audio_done = _join_thread(audio_capture, 10)
+        if _perf_stats is not None:
+            _perf_stats.close()
+            _perf_stats = None
         if not worker_done:
             print("辨識/翻譯的背景工作還沒結束（可能卡在一個很慢的請求），不等它了。")
         if not audio_done:
