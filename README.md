@@ -58,6 +58,33 @@
 設定畫面裡，如果 ④ 和 ⑤ 會形成回音迴圈（兩邊都選系統預設、選到同一個裝置，或 ⑤ 選了 CABLE），
 會直接顯示警告，按「開始」時也會再確認一次。
 
+### 氣音、ASMR 或很安靜的內容
+
+如果明明聽得到小聲說話，字幕卻幾乎不出來，可以試試**氣音模式（ASMR）**。
+一般模式會先用 Silero 判斷有沒有人說話；它比較認得平常的講話聲，氣音或很小聲的內容容易被當成安靜而跳過。
+氣音模式改成只看音量，超過門檻就送去辨識；但背景音樂、敲擊聲、環境雜音只要夠大聲也都會算成說話，
+所以適合安靜的內容，吵雜的節目仍建議用一般模式。
+
+在程式資料夾建立 `start_asmr.bat`，貼上以下內容，之後雙擊這個檔案啟動：
+
+```bat
+@echo off
+setlocal
+cd /d "%~dp0"
+set CAPTION_VAD=asmr
+python live_caption_gemini.py
+```
+
+預設音量門檻是 `60`（約 -55 dBFS），數字越小越敏感。如果還是漏掉小聲的段落，
+可以在執行 Python 的那一行前加上 `set ASMR_RMS_THRESHOLD=40` 試試；太低也會更容易把雜音送去辨識。
+
+氣音模式下，結束後用完整錄音整理逐字稿時也**不會用 Silero 過濾**，避免再把氣音跳過。
+如果要重新整理先前保留下來的錄音，把上面 `.bat` 最後一行換成以下指令即可（路徑換成自己的錄音檔）：
+
+```bat
+python live_caption_gemini.py --rebuild "transcripts\transcript_20261023_010203_audio.wav"
+```
+
 ### 使用時要注意
 
 - **不要把瀏覽器縮小**：Windows 不會繪製縮小的視窗，畫面會變黑；很多影片網站也會在視窗縮小時自動暫停。
@@ -212,6 +239,8 @@ llama-server -m 你的模型.gguf --host 127.0.0.1 --port 8766 -c 8192 -np 1 -ng
 | --- | --- | --- |
 | `TRANSLATION_BACKEND` | 上次的選擇，否則 `gemini` | `gemini` 或 `local` |
 | `WHISPER_MODEL` | GPU `large-v3`、CPU `small` | 語音辨識模型，例如 `large-v3-turbo`、`medium` |
+| `CAPTION_VAD` | 空白（一般模式） | 設成 `asmr`（`CAPTION_VAD=asmr`）開啟氣音模式，適合氣音、ASMR、很安靜的內容 |
+| `ASMR_RMS_THRESHOLD` | `60`（約 -55 dBFS） | 氣音模式的音量門檻，數字越小越敏感，也越容易收到雜音；一般模式不使用 |
 | `GEMINI_API_KEY` | 讀 `gemini_api_key.txt` | Gemini 金鑰 |
 | `GEMINI_LIVE_TIMEOUT` | `15` | Gemini 即時字幕單句的逾時秒數，超過就跳過那一句 |
 | `GEMINI_BATCH_TIMEOUT` | `120` | Gemini 事後整理每一批的逾時秒數 |
