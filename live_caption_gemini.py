@@ -119,7 +119,8 @@ from faster_whisper import WhisperModel
 from silero_vad import load_silero_vad, VADIterator
 from audio_timing import AudioRingBuffer, PlaybackDriftTracker  # 時間對齊的純邏輯，可以單獨測試
 from local_translation import (
-    LocalTranslationEngine, bilingual_pairs_acceptable, parse_bilingual_pairs, translation_problem,
+    TRANSLATION_FAILED_TEXT, LocalTranslationEngine, bilingual_pairs_acceptable, parse_bilingual_pairs,
+    translation_problem,
 )
 from llama_server import LlamaServerError, ensure_llama_server
 
@@ -574,9 +575,46 @@ def _polish_with_local_model(
 	)
 
 
+def _join_thread(thread: threading.Thread, timeout: float) -> bool:
+    """等執行緒結束；回傳它是不是真的結束了（從來沒啟動過的也算結束）。
+
+    對沒啟動過的執行緒呼叫 join() 會丟出例外，所以先看 ident；join(timeout) 時間到
+    不會告訴你結果，要再用 is_alive() 確認，不能假設已經結束。
+    """
+    if thread.ident is None:
+        return True
+    thread.join(timeout=timeout)
+    return not thread.is_alive()
+
+
 def _rebuild_command(wav_path: "Path") -> str:
     """之後重新整理這份錄音要執行的指令；用絕對路徑，在哪個資料夾貼上執行都可以。"""
     return f'python "{os.path.abspath(__file__)}" --rebuild "{os.path.abspath(wav_path)}"'
+
+
+def _rebuild_coverage(polished_parts: list[str], ja_lines: list[str], glossary: dict | None) -> tuple[int, int, int]:
+    """整份整理稿到底涵蓋了幾句：回傳 (缺少的句數, 「翻譯失敗」佔位的句數, 翻譯有問題的句數)。
+
+    不分 Gemini 或本機模型，最後都用同一個標準決定能不能刪錄音。每一批送出時的檢查
+    （bilingual_pairs_acceptable）比較寬鬆：只要涵蓋 75% 的句子就收，因為那是用來
+    決定要不要重試；但拿來決定「刪掉唯一的原始錄音」太鬆了，60 句只回 45 句也會被
+    當成完整。本機模型失敗的句子還會填「（翻譯失敗）」，以前這種情況錄音也照刪。
+    """
+    pairs = [pair for part in polished_parts for pair in parse_bilingual_pairs(part)]
+    placeholders = sum(1 for _, zh in pairs if zh.strip() == TRANSLATION_FAILED_TEXT)
+    problems = sum(
+        1 for ja, zh in pairs
+        if zh.strip() != TRANSLATION_FAILED_TEXT and translation_problem(zh, ja, glossary) is not None
+    )
+    missing = max(0, len(ja_lines) - len(pairs))
+    return missing, placeholders, problems
+
+
+def _rebuild_is_complete(missing: int, placeholders: int, problems: int, total: int) -> bool:
+    """可以放心刪錄音的標準：沒有任何「翻譯失敗」佔位；缺少的句數、翻譯有問題的句數
+    都不超過一點容許量（整理時會修正 Whisper 斷錯的句子，偶爾把兩句合成一句是正常的）"""
+    allowance = max(1, total // 20)
+    return placeholders == 0 and missing <= allowance and problems <= allowance
 
 
 def rebuild_transcript_from_full_audio(
@@ -653,10 +691,22 @@ def rebuild_transcript_from_full_audio(
             "這份逐字稿是結束播放後，用完整錄音重新辨識、翻譯模型看過完整上下文潤過的版本，"
             "準確度會比即時觀看時看到的字幕更好，內容照實呈現、沒有自己刪減。"
         )
-    if failed_batches:
+    missing, placeholders, problems = _rebuild_coverage(polished_parts, ja_lines, glossary)
+    complete = _rebuild_is_complete(missing, placeholders, problems, len(ja_lines))
+    keep_recording = bool(failed_batches) or not complete
+    if keep_recording:
+        reasons = []
+        if failed_batches:
+            reasons.append(f"有 {failed_batches} 批整理失敗（可能撞到額度限制）")
+        if missing:
+            reasons.append(f"少了 {missing} 句")
+        if placeholders:
+            reasons.append(f"{placeholders} 句翻譯失敗")
+        if problems:
+            reasons.append(f"{problems} 句翻譯可能有問題")
         # 整理稿是拿來讀、分享的，不放絕對路徑（裡面有 Windows 使用者資料夾名稱）
         summary += (
-            f"\n\n⚠️ 有 {failed_batches} 批整理失敗（可能撞到額度限制），這份整理稿有缺漏；"
+            f"\n\n⚠️ 這份整理稿可能有缺漏（{'、'.join(reasons)}，共 {len(ja_lines)} 句）；"
             f"完整錄音已保留在 {wav_path.name}，可以之後重新處理：`python live_caption_gemini.py --rebuild <這個錄音檔的路徑>`"
         )
     out_path = wav_path.with_name(wav_path.stem.replace("_audio", "") + "_notebooklm_style.md")
@@ -673,10 +723,11 @@ def rebuild_transcript_from_full_audio(
     out_path.write_text("\n".join(header) + "\n\n".join(polished_parts) + "\n", encoding="utf-8")
 
     # 逐字稿已經整理好了，完整錄音本來就只是拿來重新辨識用、不是給人聽的，
-    # 用完就刪掉，不用留著佔硬碟空間——但只要有任何一批整理失敗，就保留錄音，
-    # 不然缺漏的那幾批內容就永遠找不回來了
-    if failed_batches:
-        print(f"有 {failed_batches} 批整理失敗，已保留完整錄音：{wav_path}")
+    # 用完就刪掉，不用留著佔硬碟空間——但只要整理稿可能有缺漏，就保留錄音，
+    # 不然缺漏的內容就永遠找不回來了
+    if keep_recording:
+        print(f"整理稿可能有缺漏（失敗批數 {failed_batches}、少 {missing} 句、翻譯失敗 {placeholders} 句、"
+              f"可能有問題 {problems} 句，共 {len(ja_lines)} 句），已保留完整錄音：{wav_path}")
         print(f"之後可以用這行指令重新處理：{_rebuild_command(wav_path)}")
         return out_path
     try:
@@ -801,18 +852,26 @@ def find_output_device(name: str, rows: list[dict] | None = None) -> str | None:
     return None
 
 
-def set_app_output_device(process_name: str, device_name: str) -> bool:
-    """用 SoundVolumeView 把某個程式的輸出裝置切換成指定裝置，成功回傳 True"""
+def set_app_output_device(process_name: str, device_name: str, timeout: float = 10.0) -> bool:
+    """用 SoundVolumeView 把某個程式的輸出裝置切換成指定裝置，成功回傳 True。
+
+    注意：實測 SoundVolumeView 2.53 的 /SetAppDefault 就算裝置或程式不存在，結束碼也是 0，
+    所以回傳 True 只代表「指令有順利執行完」，不保證真的切換成功。結束碼不是 0、
+    逾時、或根本執行不了時才回傳 False。timeout 是每一次呼叫的秒數（要呼叫兩次）。
+    """
     if not SOUND_VOLUME_VIEW_PATH.exists():
         return False
     try:
         import subprocess
 
         for role in ("console", "multimedia"):
-            subprocess.run(
+            result = subprocess.run(
                 [str(SOUND_VOLUME_VIEW_PATH), "/SetAppDefault", device_name, role, process_name],
-                timeout=10, capture_output=True,
+                timeout=timeout, capture_output=True,
             )
+            if result.returncode != 0:
+                print(f"切換 {process_name} 輸出裝置失敗（SoundVolumeView 結束碼 {result.returncode}）")
+                return False
         return True
     except Exception as e:
         print(f"切換 {process_name} 輸出裝置失敗：{e}")
@@ -834,47 +893,65 @@ def remember_app_output_device(process_name: str, cable_device: str, rows: list[
     return device
 
 
-def restore_app_output_device(process_name: str, original_device: str | None):
+def restore_app_output_device(process_name: str, original_device: str | None, timeout: float = 10.0) -> bool:
     """結束時把程式的輸出裝置切回原本的裝置；original_device 是 None 就改回跟著系統預設的播放裝置。
-    SoundVolumeView 不存在時沒辦法切換，改成提醒使用者自己切回來。"""
+    SoundVolumeView 不存在時沒辦法切換，改成提醒使用者自己切回來。
+
+    回傳 True 代表「不用再試了」（切換指令成功，或根本沒有 SoundVolumeView 可以切）；
+    False 代表這次失敗，呼叫端可以再試一次。
+    """
     if not SOUND_VOLUME_VIEW_PATH.exists():
         print(f"請自己在 Windows 音量混音器裡把 {process_name} 的輸出裝置從「CABLE Input」改回原本的設定。")
-        return
-    if not set_app_output_device(process_name, original_device or DEFAULT_RENDER_DEVICE):
+        return True
+    if not set_app_output_device(process_name, original_device or DEFAULT_RENDER_DEVICE, timeout=timeout):
         print(f"沒辦法自動切回 {process_name} 的輸出裝置，可能需要自己在音量混音器裡切回來。")
-    elif original_device:
+        return False
+    if original_device:
         print(f"已把 {process_name} 的輸出裝置切回「{original_device}」。")
     else:
         print(f"已把 {process_name} 的輸出裝置改回跟著系統預設的播放裝置。")
+    return True
 
 
 class AudioRoutingRestorer:
-    """把來源程式（瀏覽器）的輸出裝置切回原本的，而且只會做一次。
+    """把來源程式（瀏覽器）的輸出裝置切回原本的，成功後就不會再做第二次。
 
     同一個實例會掛在好幾個地方：main() 的 finally、atexit、主控台的關閉 / Ctrl+C 事件。
-    哪一個先觸發都可以，之後的呼叫什麼都不做，不會重複切換。切回哪個裝置交給
-    restore_app_output_device：查不到原本的裝置時，讓它改回跟著系統預設的播放裝置。
+    哪一個先觸發都可以；成功之後的呼叫什麼都不做。以前是在嘗試之前就先標記「做過了」，
+    第一次失敗（例如逾時）之後，其他地方就再也不會重試；現在失敗會留給下一個觸發點
+    再試，最多 MAX_ATTEMPTS 次。切回哪個裝置交給 restore_app_output_device：查不到原本的
+    裝置時，讓它改回跟著系統預設的播放裝置。
     """
+
+    MAX_ATTEMPTS = 3
 
     def __init__(self, process_name: str, original_device: str | None):
         self.process_name = process_name
         self.original_device = original_device
         self._lock = threading.Lock()
         self._done = False
+        self._attempts = 0
 
-    def __call__(self) -> None:
+    def __call__(self, timeout: float = 10.0) -> None:
+        # 整個過程都拿著 lock：主控台事件和 finally 可能同時觸發，不能兩邊同時切換
         with self._lock:
             if self._done:
                 return
-            self._done = True
-        restore_app_output_device(self.process_name, self.original_device)
+            self._attempts += 1
+            succeeded = restore_app_output_device(self.process_name, self.original_device, timeout=timeout)
+            if succeeded or self._attempts >= self.MAX_ATTEMPTS:
+                self._done = True
+
+
+CONSOLE_CLOSE_TIMEOUT_SEC = 2.0  # 每次呼叫 SoundVolumeView 的上限；要呼叫兩次，總共在 5 秒內
 
 
 def _install_console_close_handler(callback) -> None:
-    """主控台視窗被直接關掉、按 Ctrl+C、登出或關機時，先執行 callback。
+    """主控台視窗被直接關掉、按 Ctrl+C、登出或關機時，先執行 callback(timeout=...)。
 
     直接關掉主控台時 Windows 會直接結束行程，finally 和 atexit 都不會跑；
-    這個事件處理器是唯一的機會（Windows 大約給 5 秒，夠呼叫 SoundVolumeView）。
+    這個事件處理器是唯一的機會。Windows 大約只給 5 秒，所以每次呼叫 SoundVolumeView
+    只等 CONSOLE_CLOSE_TIMEOUT_SEC 秒（平常它不到 1 秒就跑完），兩次加起來不會超過。
     回傳 False，讓 Ctrl+C 照常變成 KeyboardInterrupt。
     """
     try:
@@ -889,7 +966,7 @@ def _install_console_close_handler(callback) -> None:
             win32con.CTRL_LOGOFF_EVENT, win32con.CTRL_SHUTDOWN_EVENT,
         ):
             try:
-                callback()
+                callback(timeout=CONSOLE_CLOSE_TIMEOUT_SEC)
             except Exception as e:
                 print(f"結束時切回音訊輸出失敗：{e}")
         return False
@@ -1270,11 +1347,15 @@ class AudioCapture(threading.Thread):
         device: dict | None = None,
         record_path: "Path | None" = None,
         pause_state: "PauseState | None" = None,
+        on_error=None,
     ):
         super().__init__(daemon=True)
         self.utterance_queue = utterance_queue
         self.audio_ring = audio_ring
         self.pause_state = pause_state
+        # 出錯時除了印在終端機，也交給這個 callback（main() 用它在字幕列顯示警告）
+        self.on_error = on_error
+        self._stream = None
         self.pa = pyaudio.PyAudio()
         # 記住指定的裝置名稱，串流意外斷線要重連時，優先找回同一個裝置
         # （不然重連可能會抓回系統預設輸出，跟原本指定的虛擬音訊線對不上）
@@ -1300,7 +1381,7 @@ class AudioCapture(threading.Thread):
             min_silence_duration_ms=SILENCE_END_MS,
             speech_pad_ms=VAD_SPEECH_PAD_MS,
         )
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
 
     def start_recording(self) -> bool:
         """手動開始錄製完整音訊；已經在錄、或沒有指定檔名的話回傳 False。
@@ -1383,12 +1464,53 @@ class AudioCapture(threading.Thread):
         )
 
     def stop(self):
-        self._stop.set()
+        self._stop_event.set()
+
+    def _report_error(self, message: str) -> None:
+        print(message)
+        if self.on_error is not None:
+            try:
+                self.on_error(message)
+            except Exception:
+                pass
 
     def run(self):
+        # 不管迴圈怎麼結束（正常停止、或任何沒預料到的錯誤），串流、PyAudio 和錄音檔
+        # 都一定要關掉；以前收尾放在迴圈後面，中途出錯就會被跳過，錄音檔也沒關好
+        try:
+            self._capture_loop()
+        except Exception as e:
+            self._report_error(f"音訊擷取停止了，字幕和延遲播放的聲音不會再更新：{type(e).__name__}: {e}")
+        finally:
+            if self._stream is not None:
+                try:
+                    self._stream.stop_stream()
+                    self._stream.close()
+                except Exception:
+                    pass
+            try:
+                self.pa.terminate()
+            except Exception:
+                pass
+            self._close_recording()
+
+    def _capture_loop(self):
         # 擷取用的區塊大小可以跟 VAD 窗格大小脫鉤，這裡用接近 32ms 的原生取樣數即可
         block_frames = max(1, int(self.stream_sr * VAD_CHUNK_SAMPLES / TARGET_SR))
-        stream = self._open_stream(block_frames)
+        # 第一次開啟串流也可能失敗（裝置剛好被停用、被別的程式獨占）：跟斷線重連一樣
+        # 一直重試，不要讓整條執行緒直接結束
+        open_failures = 0
+        while not self._stop_event.is_set():
+            try:
+                stream = self._stream = self._open_stream(block_frames)
+                break
+            except Exception as e:
+                open_failures += 1
+                if open_failures == 1:
+                    self._report_error(f"開啟音訊串流失敗，會持續重試：{e}")
+                time.sleep(1.0)
+        else:
+            return
 
         pending = np.empty(0, dtype=np.float32)   # 還沒湊滿一個 VAD 窗格的殘餘音訊
         utterance_frames = []
@@ -1403,8 +1525,9 @@ class AudioCapture(threading.Thread):
 
         ring_sr = self.audio_ring.sample_rate if self.audio_ring is not None else self.stream_sr
         device_missing_warned = False
+        processing_errors = 0
 
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             try:
                 read_started = time.perf_counter()
                 data = stream.read(block_frames, exception_on_overflow=False)
@@ -1431,7 +1554,7 @@ class AudioCapture(threading.Thread):
                     pass
 
                 time.sleep(0.5)
-                if self._stop.is_set():
+                if self._stop_event.is_set():
                     break
 
                 try:
@@ -1447,7 +1570,7 @@ class AudioCapture(threading.Thread):
                     self.stream_sr = int(self.device["defaultSampleRate"])
                     self.channels = self.device["maxInputChannels"]
                     block_frames = max(1, int(self.stream_sr * VAD_CHUNK_SAMPLES / TARGET_SR))
-                    stream = self._open_stream(block_frames)
+                    stream = self._stream = self._open_stream(block_frames)
                     print(f"音訊串流已重新開啟：{self.device['name']} ({self.stream_sr} Hz, {self.channels} ch)")
                     if self.stream_sr != ring_sr:
                         print(f"重新開啟後取樣率變成 {self.stream_sr} Hz，會先轉換成 {ring_sr} Hz 再延遲播放。")
@@ -1479,67 +1602,81 @@ class AudioCapture(threading.Thread):
                 captured_end = None
             was_paused = False
 
-            frames = np.frombuffer(data, dtype=np.float32).reshape(-1, max(1, self.channels))
-            # 給 Whisper / VAD / 錄音的是單聲道；給延遲播放的保留原本的聲道數（立體聲）
-            audio = frames.mean(axis=1) if frames.shape[1] > 1 else frames[:, 0]
+            # 這一段的處理（轉換取樣率、寫錄音、VAD）出錯時，跳過這一段繼續擷取，
+            # 不要讓整條執行緒結束——以前這裡出錯，字幕和錄音就默默停了
+            try:
+                frames = np.frombuffer(data, dtype=np.float32).reshape(-1, max(1, self.channels))
+                # 給 Whisper / VAD / 錄音的是單聲道；給延遲播放的保留原本的聲道數（立體聲）
+                audio = frames.mean(axis=1) if frames.shape[1] > 1 else frames[:, 0]
 
-            if self.audio_ring is not None:
-                # 存原始擷取取樣率的音訊給延遲播放用，不要存降到 16kHz 之後的版本——
-                # resample_linear 是單純線性內插、沒有做降頻前該有的抗鋸齒濾波，
-                # 拿去餵 Whisper 沒差，但直接播給人聽會多一層可聽見的雜訊/悶悶的感覺。
-                ring_frames = frames
-                if self.stream_sr != ring_sr:
-                    # 重連後取樣率變了（很少見）：先轉成緩衝區原本的取樣率，不然聲音速度和音高會錯
-                    ring_frames = resample_high_quality(frames, self.stream_sr, ring_sr)
-                    captured_end = None
-                self.audio_ring.write(ring_frames, captured_end=captured_end)
+                if self.audio_ring is not None:
+                    # 存原始擷取取樣率的音訊給延遲播放用，不要存降到 16kHz 之後的版本——
+                    # resample_linear 是單純線性內插、沒有做降頻前該有的抗鋸齒濾波，
+                    # 拿去餵 Whisper 沒差，但直接播給人聽會多一層可聽見的雜訊/悶悶的感覺。
+                    ring_frames = frames
+                    if self.stream_sr != ring_sr:
+                        # 重連後取樣率變了（很少見）：先轉成緩衝區原本的取樣率，不然聲音速度和音高會錯
+                        ring_frames = resample_high_quality(frames, self.stream_sr, ring_sr)
+                        captured_end = None
+                    self.audio_ring.write(ring_frames, captured_end=captured_end)
 
-            audio_16k = resample_linear(audio, self.stream_sr, TARGET_SR)
+                audio_16k = resample_linear(audio, self.stream_sr, TARGET_SR)
 
-            self._write_recording(audio_16k)
+                self._write_recording(audio_16k)
 
-            pending = np.concatenate([pending, audio_16k])
+                pending = np.concatenate([pending, audio_16k])
 
-            # 用固定窗格大小餵給 Silero VAD，累積出一句一句的語音
-            while len(pending) >= VAD_CHUNK_SAMPLES:
-                chunk = pending[:VAD_CHUNK_SAMPLES]
-                pending = pending[VAD_CHUNK_SAMPLES:]
+                # 用固定窗格大小餵給 Silero VAD，累積出一句一句的語音
+                while len(pending) >= VAD_CHUNK_SAMPLES:
+                    chunk = pending[:VAD_CHUNK_SAMPLES]
+                    pending = pending[VAD_CHUNK_SAMPLES:]
 
-                chunk_ms = VAD_CHUNK_SAMPLES / TARGET_SR * 1000
-                event = self.vad_iterator(torch.from_numpy(chunk), return_seconds=False)
+                    chunk_ms = VAD_CHUNK_SAMPLES / TARGET_SR * 1000
+                    event = self.vad_iterator(torch.from_numpy(chunk), return_seconds=False)
 
-                if event is not None and "start" in event:
-                    speech_active = True
-                    utterance_frames = []
-                    utterance_ms = 0
-                    utterance_start_time = time.time()
-
-                if speech_active:
-                    utterance_frames.append(chunk)
-                    utterance_ms += chunk_ms
-
-                force_flush = utterance_ms / 1000 >= MAX_UTTERANCE_SEC
-                is_end = event is not None and "end" in event
-
-                if speech_active and (is_end or force_flush):
-                    utterance = np.concatenate(utterance_frames)
-                    # 記下這句話「開口講的那一刻」，不是「講完的那一刻」——字幕要對上
-                    # 延遲畫面裡這個人開口的瞬間，用開始時間才對；如果用講完的時間去加
-                    # DISPLAY_DELAY_SEC，長句子（例如講滿 10 秒才被強制切斷）算出來的
-                    # release_at 會剛好等於延遲畫面「整句話已經播完」的那一刻，變成要等
-                    # 聽完一整句才看到字幕，完全喪失延遲緩衝原本要爭取的時間。
-                    self.utterance_queue.put((utterance, utterance_start_time or time.time()))
-                    utterance_frames = []
-                    utterance_ms = 0
-                    speech_active = not is_end  # 強制切斷後若還在講話，繼續累積下一段
-                    if speech_active:
-                        # 被迫切斷但這個人還在講、還沒停頓，剩下這段話就從「現在」這一刻算起
+                    if event is not None and "start" in event:
+                        speech_active = True
+                        utterance_frames = []
+                        utterance_ms = 0
                         utterance_start_time = time.time()
 
-        stream.stop_stream()
-        stream.close()
-        self.pa.terminate()
-        self._close_recording()
+                    if speech_active:
+                        utterance_frames.append(chunk)
+                        utterance_ms += chunk_ms
+
+                    force_flush = utterance_ms / 1000 >= MAX_UTTERANCE_SEC
+                    is_end = event is not None and "end" in event
+
+                    if speech_active and (is_end or force_flush):
+                        utterance = np.concatenate(utterance_frames)
+                        # 記下這句話「開口講的那一刻」，不是「講完的那一刻」——字幕要對上
+                        # 延遲畫面裡這個人開口的瞬間，用開始時間才對；如果用講完的時間去加
+                        # DISPLAY_DELAY_SEC，長句子（例如講滿 10 秒才被強制切斷）算出來的
+                        # release_at 會剛好等於延遲畫面「整句話已經播完」的那一刻，變成要等
+                        # 聽完一整句才看到字幕，完全喪失延遲緩衝原本要爭取的時間。
+                        self.utterance_queue.put((utterance, utterance_start_time or time.time()))
+                        utterance_frames = []
+                        utterance_ms = 0
+                        speech_active = not is_end  # 強制切斷後若還在講話，繼續累積下一段
+                        if speech_active:
+                            # 被迫切斷但這個人還在講、還沒停頓，剩下這段話就從「現在」這一刻算起
+                            utterance_start_time = time.time()
+
+            except Exception as e:
+                processing_errors += 1
+                if processing_errors == 1 or processing_errors % 50 == 0:
+                    self._report_error(
+                        f"處理音訊時發生錯誤（第 {processing_errors} 次），先跳過這一段：{type(e).__name__}: {e}"
+                    )
+                # 狀態可能已經不一致：丟掉還沒講完的句子，VAD 重新開始
+                speech_active = False
+                utterance_frames = []
+                utterance_ms = 0
+                pending = np.empty(0, dtype=np.float32)
+                try:
+                    self.vad_iterator.reset_states()
+                except Exception:
+                    pass
 
 
 _SYSTEM_PROMPT_BASE = (
@@ -1776,7 +1913,7 @@ class Worker(threading.Thread):
         )
         # main() 會先建好翻譯引擎（金鑰或本機服務有問題就在動到音訊設定前結束）
         self.translator = translator if translator is not None else Translator()
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
 
         # 用來偵測 Whisper 卡進「幻覺迴圈」：音訊有雜音/glitch 時，有時候會連續
         # 辨識出同一句幾乎一模一樣的短句（常常剛好是提示詞裡的專有名詞），而且
@@ -1799,11 +1936,11 @@ class Worker(threading.Thread):
         print(f"逐字稿將儲存於：{self.log_path}")
 
     def stop(self):
-        self._stop.set()
+        self._stop_event.set()
 
     def run(self):
         failures = 0  # 連續失敗幾句；成功一句就歸零
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             if self.pause_state is not None and self.pause_state.is_paused():
                 time.sleep(0.1)
                 continue
@@ -2336,6 +2473,7 @@ def main():
     audio_capture = AudioCapture(
         utterance_queue, audio_ring=audio_ring, device=input_device,
         record_path=raw_audio_path, pause_state=pause_state,
+        on_error=lambda message: caption_queue.put((time.time(), "⚠ 音訊擷取發生錯誤（詳見終端機）", message)),
     )
     worker = Worker(
         utterance_queue, caption_queue, transcript_queue, episode_title,
@@ -2435,14 +2573,19 @@ def main():
             # 沒有 SoundVolumeView、沒辦法自動切換時，提醒使用者自己切回來
             restore_app_output_device(source_process_name, original_output_device)
 
-        # 等背景執行緒真的寫完檔案，再去讀來整理（中途出錯時執行緒可能根本還沒啟動，
-        # 對沒啟動過的執行緒呼叫 join() 會丟出例外，蓋掉原本的錯誤）
-        if worker.ident is not None:
-            worker.join(timeout=5)
+        # 等背景執行緒真的結束，再去讀檔案來整理（中途出錯時執行緒可能根本還沒啟動，
+        # 對沒啟動過的執行緒呼叫 join() 會丟出例外，蓋掉原本的錯誤）。
+        # Worker 可能正在等一個翻譯請求（最多 GEMINI_LIVE_TIMEOUT_SEC）或在辨識，給它
+        # 足夠的時間；以前只等 5 秒、也不檢查有沒有真的結束，事後整理就可能跟還在跑的
+        # Worker 同時使用同一個 Whisper 模型和翻譯引擎
+        worker_done = _join_thread(worker, GEMINI_LIVE_TIMEOUT_SEC + 15)
         # 完整錄音的 WAV 檔要等 AudioCapture 執行緒真的跑完、把檔案關閉寫入磁碟，
         # 才能安全地拿去重新辨識——不然可能讀到還沒寫完、不完整的檔案
-        if audio_capture.ident is not None:
-            audio_capture.join(timeout=5)
+        audio_done = _join_thread(audio_capture, 10)
+        if not worker_done:
+            print("辨識/翻譯的背景工作還沒結束（可能卡在一個很慢的請求），不等它了。")
+        if not audio_done:
+            print("音訊擷取的背景工作還沒結束，完整錄音可能還沒寫完。")
         print("已停止擷取，逐字稿已存檔。")
 
         try:
@@ -2458,6 +2601,11 @@ def main():
 
         if not raw_audio_path.exists():
             print("這次沒有按下「開始錄製」，沒有完整錄音可以拿去重新整理。")
+        elif not (worker_done and audio_done):
+            # 背景工作沒有確定結束時不要整理：可能跟還在跑的 Worker 搶同一個模型，
+            # 或讀到還沒寫完的錄音。錄音留著，之後用 --rebuild 重新整理就好
+            print(f"背景工作還沒確定結束，這次先不整理，已保留完整錄音：{raw_audio_path}")
+            print(f"之後可以用這行指令重新處理：{_rebuild_command(raw_audio_path)}")
         else:
             try:
                 notebooklm_style_path = rebuild_transcript_from_full_audio(

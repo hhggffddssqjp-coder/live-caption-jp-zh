@@ -327,6 +327,53 @@ class GeminiPathTests(TranslationBackendTestCase):
 		self.assertEqual(len(calls), 1)
 		self.assertFalse(wav_path.exists())
 
+	def test_gemini_reply_missing_a_quarter_passes_the_batch_check_but_keeps_the_wav(self):
+		# 45 of 60 lines is enough for the per-batch retry check (75%), so it is not retried,
+		# but deleting the only recording needs (almost) every line
+		lines = [f"日文{i}です。" for i in range(60)]
+		translator, calls = self.gemini_translator(lambda contents, n: bilingual_reply(contents, "缺", keep=45))
+		out_path, wav_path = self.run_reconstruction(translator, lines)
+		self.assertEqual(len(calls), 1)
+		self.assertTrue(wav_path.exists())
+		self.assertIn("少了 15 句", out_path.read_text(encoding="utf-8"))
+
+	def test_rebuild_coverage_counts_missing_placeholder_and_problem_lines(self):
+		lines = [f"日文{i}です。" for i in range(5)]
+		parts = [
+			"日文0です。\n譯文0\n\n日文1です。\n（翻譯失敗）",
+			"日文2です。\nこれは翻訳されていないです",  # still Japanese: a translation problem
+		]
+		self.assertEqual(self.app._rebuild_coverage(parts, lines, None), (2, 1, 1))
+
+	def test_join_thread_reports_whether_the_thread_really_finished(self):
+		import threading
+		import time
+		self.assertTrue(self.app._join_thread(threading.Thread(target=lambda: None), 0.1))  # never started
+		done = threading.Thread(target=lambda: None)
+		done.start()
+		self.assertTrue(self.app._join_thread(done, 1.0))
+		release = threading.Event()
+		stuck = threading.Thread(target=release.wait, daemon=True)
+		stuck.start()
+		started = time.perf_counter()
+		self.assertFalse(self.app._join_thread(stuck, 0.2))  # timed out: must not pretend it ended
+		self.assertLess(time.perf_counter() - started, 1.0)
+		release.set()
+		stuck.join(timeout=1)
+
+	def test_worker_and_capture_do_not_shadow_thread_internals(self):
+		# Python 3.10-3.12 call Thread._stop() while joining; an Event stored there breaks join()
+		self.assertFalse(hasattr(self.app.Worker, "_stop") and not callable(getattr(self.app.Worker, "_stop")))
+		source = Path(self.app.__file__).read_text(encoding="utf-8")
+		self.assertNotIn("self._stop = threading.Event()", source)
+
+	def test_rebuild_is_complete_allows_a_few_merged_lines_but_no_placeholders(self):
+		self.assertTrue(self.app._rebuild_is_complete(missing=3, placeholders=0, problems=0, total=60))
+		self.assertFalse(self.app._rebuild_is_complete(missing=4, placeholders=0, problems=0, total=60))
+		self.assertFalse(self.app._rebuild_is_complete(missing=0, placeholders=1, problems=0, total=60))
+		self.assertFalse(self.app._rebuild_is_complete(missing=0, placeholders=0, problems=4, total=60))
+		self.assertTrue(self.app._rebuild_is_complete(missing=1, placeholders=0, problems=1, total=5))
+
 
 
 class PromptParityTests(TranslationBackendTestCase):
@@ -596,6 +643,64 @@ class RecordingTests(TranslationBackendTestCase):
 		capture._wav_lock = __import__("threading").Lock()
 		return capture
 
+	def make_running_capture(self, open_results):
+		"""An AudioCapture wired to fakes: _open_stream returns/raises open_results in order."""
+		import threading
+		capture = self.make_capture(None)
+		capture._stop_event = threading.Event()
+		capture._stream = None
+		capture.pa = mock.Mock()
+		capture.on_error = mock.Mock()
+		capture.stream_sr = 48000
+		capture.channels = 2
+		capture.device = {"name": "CABLE Input (VB-Audio Virtual Cable) [Loopback]"}
+		capture._preferred_name = capture.device["name"]
+		capture.audio_ring = None
+		capture.pause_state = None
+		capture.vad_iterator = mock.Mock()
+		capture._open_stream = mock.Mock(side_effect=open_results)
+		return capture
+
+	def test_run_always_cleans_up_and_reports_when_the_loop_crashes(self):
+		capture = self.make_running_capture([])
+		stream = mock.Mock()
+		capture._stream = stream
+		capture._capture_loop = mock.Mock(side_effect=RuntimeError("boom"))
+		with mock.patch("builtins.print"):
+			capture.run()
+		stream.close.assert_called_once_with()
+		capture.pa.terminate.assert_called_once_with()
+		self.assertIn("音訊擷取停止了", capture.on_error.call_args.args[0])
+
+	def test_first_open_failure_is_retried_and_a_bad_block_does_not_end_the_thread(self):
+		stream = mock.Mock()
+		reads = []
+
+		def read(frames, exception_on_overflow=False):
+			reads.append(frames)
+			if len(reads) >= 2:
+				capture._stop_event.set()
+			return b"\x00\x00\x00\x00" * 2 * frames
+
+		stream.read.side_effect = read
+		capture = self.make_running_capture([OSError("device busy"), stream])
+		# numpy is stubbed in this module; this stand-in only supports what the loop needs, and
+		# its frombuffer raises: that is the "processing one block failed" case, after which the
+		# loop must keep reading
+		fake_np = types.SimpleNamespace(
+			empty=lambda *a, **k: [], float32="float32",
+			frombuffer=mock.Mock(side_effect=ValueError("bad block")),
+		)
+		with mock.patch.object(self.app.time, "sleep"), mock.patch("builtins.print"), \
+				mock.patch.object(self.app, "np", fake_np):
+			capture.run()
+		self.assertEqual(capture._open_stream.call_count, 2)       # retried after the first failure
+		self.assertEqual(len(reads), 2)                            # kept reading after the bad block
+		messages = [call.args[0] for call in capture.on_error.call_args_list]
+		self.assertTrue(any("開啟音訊串流失敗" in m for m in messages))
+		self.assertTrue(any("處理音訊時發生錯誤" in m for m in messages))
+		stream.close.assert_called_once_with()                     # cleaned up by run()'s finally
+
 	def test_stop_then_start_again_appends_instead_of_overwriting(self):
 		import wave
 		fake_np = types.SimpleNamespace(clip=lambda x, *_: x, int16="int16")
@@ -644,14 +749,39 @@ class AudioRoutingTests(TranslationBackendTestCase):
 			restore = self.app.AudioRoutingRestorer("brave.exe", "Realtek(R) Audio\\Device\\耳機\\Render")
 			restore()
 			restore()  # finally + atexit + console handler may all fire
-		set_device.assert_called_once_with("brave.exe", "Realtek(R) Audio\\Device\\耳機\\Render")
+		set_device.assert_called_once_with("brave.exe", "Realtek(R) Audio\\Device\\耳機\\Render", timeout=10.0)
+
+	def test_restorer_retries_on_the_next_trigger_after_a_failure(self):
+		self.patch_sound_volume_view()
+		with mock.patch.object(self.app, "set_app_output_device", side_effect=[False, True]) as set_device:
+			restore = self.app.AudioRoutingRestorer("brave.exe", None)
+			restore()  # e.g. the console handler timed out
+			restore()  # finally / atexit tries again
+			restore()  # already succeeded: nothing more
+		self.assertEqual(set_device.call_count, 2)
+
+	def test_restorer_gives_up_after_max_attempts(self):
+		self.patch_sound_volume_view()
+		with mock.patch.object(self.app, "set_app_output_device", return_value=False) as set_device:
+			restore = self.app.AudioRoutingRestorer("brave.exe", None)
+			for _ in range(5):
+				restore()
+		self.assertEqual(set_device.call_count, self.app.AudioRoutingRestorer.MAX_ATTEMPTS)
+
+	def test_non_zero_exit_code_counts_as_a_failed_switch(self):
+		self.patch_sound_volume_view()
+		with mock.patch("subprocess.run", return_value=types.SimpleNamespace(returncode=3)):
+			self.assertFalse(self.app.set_app_output_device("brave.exe", "DefaultRenderDevice"))
+		with mock.patch("subprocess.run", return_value=types.SimpleNamespace(returncode=0)) as run:
+			self.assertTrue(self.app.set_app_output_device("brave.exe", "DefaultRenderDevice", timeout=2.0))
+		self.assertEqual(run.call_args.kwargs["timeout"], 2.0)
 
 	def test_restorer_without_a_remembered_device_follows_the_system_default(self):
 		# goes through restore_app_output_device: back to "follow the system default", not pinned
 		self.patch_sound_volume_view()
 		with mock.patch.object(self.app, "set_app_output_device", return_value=True) as set_device:
 			self.app.AudioRoutingRestorer("brave.exe", None)()
-		set_device.assert_called_once_with("brave.exe", "DefaultRenderDevice")
+		set_device.assert_called_once_with("brave.exe", "DefaultRenderDevice", timeout=10.0)
 
 	def test_console_close_event_runs_the_restorer(self):
 		handlers = []
@@ -663,7 +793,9 @@ class AudioRoutingTests(TranslationBackendTestCase):
 		with mock.patch.dict(sys.modules, {"win32api": win32api, "win32con": win32con}):
 			self.app._install_console_close_handler(callback)
 		self.assertFalse(handlers[0](2))  # CTRL_CLOSE_EVENT: run it, but let Windows continue
-		callback.assert_called_once_with()
+		# short per-call timeout so both SoundVolumeView calls fit in Windows' ~5 s close window
+		callback.assert_called_once_with(timeout=self.app.CONSOLE_CLOSE_TIMEOUT_SEC)
+		self.assertLessEqual(2 * self.app.CONSOLE_CLOSE_TIMEOUT_SEC, 5)
 
 	def test_inactive_session_listed_first_is_not_the_current_device(self):
 		self.assertEqual(self.app.get_app_output_device("firefox.exe", SESSION_ROWS),
@@ -704,8 +836,8 @@ class AudioRoutingTests(TranslationBackendTestCase):
 	def test_restore_without_a_remembered_device_follows_the_system_default(self):
 		self.patch_sound_volume_view()
 		with mock.patch.object(self.app, "set_app_output_device", return_value=True) as set_device:
-			self.app.restore_app_output_device("brave.exe", None)
-		set_device.assert_called_once_with("brave.exe", "DefaultRenderDevice")
+			self.assertTrue(self.app.restore_app_output_device("brave.exe", None))
+		set_device.assert_called_once_with("brave.exe", "DefaultRenderDevice", timeout=10.0)
 		self.assertIn("跟著系統預設的播放裝置", self.printed_text())
 		self.assertNotIn("沒辦法自動切回", self.printed_text())
 
@@ -714,7 +846,7 @@ class AudioRoutingTests(TranslationBackendTestCase):
 		device = "Realtek(R) Audio\\Device\\Realtek HD Audio 2nd output\\Render"
 		with mock.patch.object(self.app, "set_app_output_device", return_value=True) as set_device:
 			self.app.restore_app_output_device("brave.exe", device)
-		set_device.assert_called_once_with("brave.exe", device)
+		set_device.assert_called_once_with("brave.exe", device, timeout=10.0)
 		self.assertIn(f"已把 brave.exe 的輸出裝置切回「{device}」。", self.printed_text())
 		self.assertNotIn("沒辦法自動切回", self.printed_text())
 
