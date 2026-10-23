@@ -225,6 +225,7 @@ llama-server -m 你的模型.gguf --host 127.0.0.1 --port 8766 -c 8192 -np 1 -ng
 | `WHISPER_MODEL` | GPU `large-v3`、CPU `small` | 語音辨識模型，例如 `large-v3-turbo`、`medium` |
 | `CAPTION_VAD` | 空白（一般模式） | 設成 `asmr`（`CAPTION_VAD=asmr`）開啟氣音模式，適合氣音、ASMR、很安靜的內容 |
 | `ASMR_RMS_THRESHOLD` | `60`（約 -55 dBFS） | 氣音模式的音量門檻，數字越小越敏感，也越容易收到雜音；一般模式不使用 |
+| `CAPTION_PERF_LOG` | 關閉 | 設為 `1`，每秒寫入 `logs/perf_caption_<開始時間>.csv`，量測畫面卡頓、GC、記憶體與系統負載；結束時會寫完最後一筆 |
 | `GEMINI_API_KEY` | 讀 `gemini_api_key.txt` | Gemini 金鑰 |
 | `GEMINI_LIVE_TIMEOUT` | `15` | Gemini 即時字幕單句的逾時秒數，超過就跳過那一句 |
 | `GEMINI_BATCH_TIMEOUT` | `120` | Gemini 事後整理每一批的逾時秒數 |
