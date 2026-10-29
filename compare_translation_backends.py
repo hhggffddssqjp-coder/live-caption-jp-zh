@@ -15,14 +15,13 @@ transcripts/transcript_*.txt，會自動取出裡面的 JP 句子。
 兩個引擎用的是跟主程式完全相同的 Translator 與提示詞：逐句、帶前一句上下文
 （跟即時字幕的路徑一樣）。
 
-報告內容：每個引擎的失敗/問題率（空白、照抄提示、沒翻成中文、過長）、術語命中率、
+報告內容：每個引擎的失敗/問題率（空白、照抄提示、沒翻成中文、過長）、
 延遲，兩邊譯文的 chrF 相似度；加 --judge 會請 Gemini 盲評每一句（A/B 隨機排序），
 算出本機模型的勝率分數。Gemini 評審如果偏好自己的譯文，只會讓本機模型更難過關，
 所以通過門檻的結果是保守的。
 
 門檻（都可以用參數調整），全部通過才回傳 exit code 0：
     本機問題率 ≤ Gemini 問題率 + 2%
-    本機術語命中率 ≥ Gemini 術語命中率 - 2%（樣本裡有術語時才檢查）
     有 --judge 時：本機分數（勝 + 平手/2）≥ 0.45
 """
 
@@ -89,16 +88,6 @@ def chrf(hypothesis: str, reference: str, max_n: int = 6, beta: float = 2.0) -> 
 	return 100.0 * (1 + beta ** 2) * precision * recall / (beta ** 2 * precision + recall)
 
 
-def glossary_expectations(source: str, glossary: dict | None) -> list[str]:
-	"""Display text expected in the translation for glossary terms present in ``source``."""
-	expected = []
-	for term in sorted((key for key in (glossary or {}) if isinstance(key, str) and key), key=len, reverse=True):
-		if term in source and not any(term in longer for longer in expected):
-			target = glossary.get(term)
-			expected.append(target if isinstance(target, str) and target.strip() else term)
-	return expected
-
-
 def percentile(values: list[float], fraction: float) -> float:
 	if not values:
 		return 0.0
@@ -124,18 +113,18 @@ class BackendRun:
 	latencies: list = field(default_factory=list)
 
 
-def run_live(name, translator, samples, glossary, *, pace_seconds=0.0, retry_empty=0, retry_wait=20.0, sleep=time.sleep, clock=time.perf_counter) -> BackendRun:
+def run_live(name, translator, samples, *, pace_seconds=0.0, retry_empty=0, retry_wait=20.0, sleep=time.sleep, clock=time.perf_counter) -> BackendRun:
 	"""Translate like the live Worker: each sentence with the previous one as context."""
 	run = BackendRun(name)
 	for index, sentence in enumerate(samples):
 		previous = samples[index - 1] if index > 0 else ""
 		started = clock()
-		output = translator.translate_with_context(previous, sentence, glossary)
+		output = translator.translate_with_context(previous, sentence)
 		for _ in range(retry_empty):
 			if output:
 				break
 			sleep(retry_wait)
-			output = translator.translate_with_context(previous, sentence, glossary)
+			output = translator.translate_with_context(previous, sentence)
 		run.latencies.append(clock() - started)
 		run.outputs.append(output or "")
 		print(f"  [{name}] {index + 1}/{len(samples)}")
@@ -144,24 +133,18 @@ def run_live(name, translator, samples, glossary, *, pace_seconds=0.0, retry_emp
 	return run
 
 
-def summarize(run: BackendRun, samples: list[str], glossary: dict | None) -> dict:
+def summarize(run: BackendRun, samples: list[str]) -> dict:
 	problems = Counter()
-	glossary_total = glossary_hits = 0
 	for sentence, output in zip(samples, run.outputs):
-		problem = translation_problem(output, sentence, glossary)
+		problem = translation_problem(output, sentence)
 		if problem:
 			problems[problem] += 1
-		for expected in glossary_expectations(sentence, glossary):
-			glossary_total += 1
-			glossary_hits += expected in output
 	count = max(1, len(samples))
 	return {
 		"name": run.name,
 		"count": len(samples),
 		"problem_rate": sum(problems.values()) / count,
 		"problems": dict(problems),
-		"glossary_total": glossary_total,
-		"glossary_rate": glossary_hits / glossary_total if glossary_total else None,
 		"latency_p50": percentile(run.latencies, 0.5),
 		"latency_p95": percentile(run.latencies, 0.95),
 	}
@@ -224,13 +207,10 @@ def judge_stats(verdicts: list[str]) -> dict:
 
 # ---------- gate and report ----------
 
-def evaluate_gate(gemini: dict, local: dict, judged: dict | None, *, max_problem_gap: float, max_glossary_gap: float, min_judge_score: float) -> tuple[bool, list[str]]:
+def evaluate_gate(gemini: dict, local: dict, judged: dict | None, *, max_problem_gap: float, min_judge_score: float) -> tuple[bool, list[str]]:
 	checks = []
 	passed = local["problem_rate"] <= gemini["problem_rate"] + max_problem_gap
 	checks.append((passed, f"問題率：本機 {local['problem_rate']:.1%}，Gemini {gemini['problem_rate']:.1%}（容許差 {max_problem_gap:.0%}）"))
-	if gemini["glossary_rate"] is not None and local["glossary_rate"] is not None:
-		passed = local["glossary_rate"] >= gemini["glossary_rate"] - max_glossary_gap
-		checks.append((passed, f"術語命中率：本機 {local['glossary_rate']:.1%}，Gemini {gemini['glossary_rate']:.1%}（容許差 {max_glossary_gap:.0%}）"))
 	if judged is not None:
 		passed = judged["judged"] > 0 and judged["score"] >= min_judge_score
 		checks.append((passed, f"盲評分數：本機 {judged['score']:.2f}（勝 {judged['win']}／平 {judged['tie']}／負 {judged['loss']}，95% 下界 {judged['score_lower_95']:.2f}，門檻 {min_judge_score:.2f}）"))
@@ -251,13 +231,12 @@ def render_report(samples, runs, summaries, verdicts, judged, gate) -> str:
 		"",
 		"## 摘要",
 		"",
-		"| 引擎 | 問題率 | 問題類型 | 術語命中率 | 延遲 p50 | 延遲 p95 |",
-		"| --- | --- | --- | --- | --- | --- |",
+		"| 引擎 | 問題率 | 問題類型 | 延遲 p50 | 延遲 p95 |",
+		"| --- | --- | --- | --- | --- |",
 	]
 	for summary in summaries.values():
-		glossary = "—" if summary["glossary_rate"] is None else f"{summary['glossary_rate']:.1%}（{summary['glossary_total']} 處）"
 		problems = "、".join(f"{kind} {count}" for kind, count in sorted(summary["problems"].items())) or "無"
-		lines.append(f"| {summary['name']} | {summary['problem_rate']:.1%} | {problems} | {glossary} | {summary['latency_p50']:.2f}s | {summary['latency_p95']:.2f}s |")
+		lines.append(f"| {summary['name']} | {summary['problem_rate']:.1%} | {problems} | {summary['latency_p50']:.2f}s | {summary['latency_p95']:.2f}s |")
 	if "gemini" in runs and "local" in runs:
 		similarity = statistics.mean(chrf(local, gemini) for local, gemini in zip(runs["local"].outputs, runs["gemini"].outputs)) if samples else 0.0
 		lines += ["", f"本機譯文與 Gemini 譯文的平均 chrF 相似度：{similarity:.1f}（只代表相似程度，不代表好壞）"]
@@ -286,22 +265,15 @@ def _default_translator_factory(backend: str):
 	return Translator(backend)
 
 
-def _default_glossary():
-	from live_caption_gemini import load_glossary
-	return load_glossary()
-
-
-def main(argv=None, *, translator_factory=None, glossary_loader=None, sleep=time.sleep) -> int:
+def main(argv=None, *, translator_factory=None, sleep=time.sleep) -> int:
 	parser = argparse.ArgumentParser(description="比較 Gemini 與本機語言模型的翻譯結果")
 	parser.add_argument("samples", help="日文樣本檔（一行一句，或 transcripts/transcript_*.txt）")
 	parser.add_argument("--backends", default="gemini,local", help="要比較的引擎，逗號分隔（預設 gemini,local）")
-	parser.add_argument("--glossary", help="術語表 JSON（預設讀 glossary.json）")
 	parser.add_argument("--limit", type=int, default=None, help="只取前 N 句")
 	parser.add_argument("--judge", action="store_true", help="請 Gemini 盲評每一句（需要 gemini 與 local 都有跑）")
 	parser.add_argument("--gemini-interval", type=float, default=4.5, help="Gemini 每次呼叫之間等待的秒數（避免撞到每分鐘額度）")
 	parser.add_argument("--seed", type=int, default=1234, help="盲評 A/B 排序的亂數種子")
 	parser.add_argument("--max-problem-gap", type=float, default=0.02)
-	parser.add_argument("--max-glossary-gap", type=float, default=0.02)
 	parser.add_argument("--min-judge-score", type=float, default=0.45)
 	parser.add_argument("--out", help="報告輸出路徑（預設：樣本檔名_backend_report.md）")
 	parser.add_argument("--json", dest="json_path", help="另外輸出 JSON 結果")
@@ -320,10 +292,6 @@ def main(argv=None, *, translator_factory=None, glossary_loader=None, sleep=time
 		print("--judge 需要同時比較 gemini 與 local。")
 		return 2
 
-	if args.glossary:
-		glossary = json.loads(Path(args.glossary).read_text(encoding="utf-8"))
-	else:
-		glossary = (glossary_loader or _default_glossary)()
 	translator_factory = translator_factory or _default_translator_factory
 
 	runs, translators = {}, {}
@@ -331,9 +299,9 @@ def main(argv=None, *, translator_factory=None, glossary_loader=None, sleep=time
 		print(f"=== {name}：{len(samples)} 句 ===")
 		translators[name] = translator_factory(name)
 		pace = args.gemini_interval if name == "gemini" else 0.0
-		runs[name] = run_live(name, translators[name], samples, glossary, pace_seconds=pace, retry_empty=2 if name == "gemini" else 0, sleep=sleep)
+		runs[name] = run_live(name, translators[name], samples, pace_seconds=pace, retry_empty=2 if name == "gemini" else 0, sleep=sleep)
 
-	summaries = {name: summarize(run, samples, glossary) for name, run in runs.items()}
+	summaries = {name: summarize(run, samples) for name, run in runs.items()}
 	verdicts, judged = [], None
 	if args.judge:
 		print("=== Gemini 盲評 ===")
@@ -346,7 +314,7 @@ def main(argv=None, *, translator_factory=None, glossary_loader=None, sleep=time
 	if "gemini" in summaries and "local" in summaries:
 		gate = evaluate_gate(
 			summaries["gemini"], summaries["local"], judged,
-			max_problem_gap=args.max_problem_gap, max_glossary_gap=args.max_glossary_gap, min_judge_score=args.min_judge_score,
+			max_problem_gap=args.max_problem_gap, min_judge_score=args.min_judge_score,
 		)
 
 	report = render_report(samples, runs, summaries, verdicts, judged, gate)

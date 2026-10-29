@@ -92,7 +92,6 @@ import os
 import ntpath
 import sys
 import re
-import json
 import time
 import ctypes
 import queue
@@ -264,101 +263,10 @@ BUFFER_MARGIN_SEC = 8.0
 TRANSCRIPT_DIR = Path(__file__).parent / "transcripts"
 TRANSCRIPT_DIR.mkdir(exist_ok=True)
 
-GLOSSARY_PATH = Path(__file__).parent / "glossary.json"
-
 # 用來自動把瀏覽器輸出裝置切到虛擬音訊線、結束時再切回去的小工具（NirSoft SoundVolumeView）
 SOUND_VOLUME_VIEW_PATH = Path(__file__).parent / "tools" / "SoundVolumeView.exe"
 # SoundVolumeView 的特殊裝置名稱：用它切換等於讓程式改回跟著系統預設的播放裝置
 DEFAULT_RENDER_DEVICE = "DefaultRenderDevice"
-
-# 第一次執行會照這份預設值建立 glossary.json，之後你可以自己編輯增減
-# （常客來賓名字、節目裡的哏、常出現的專有名詞都可以加進去）
-_DEFAULT_GLOSSARY = {
-    "羊宮妃那": "羊宮妃那",
-    "ゆみやひな": "羊宮妃那",
-    "陽宮ひな": "羊宮妃那",
-    "羊宮妃那のHOOOOPE!": "羊宮妃那のHOOOOPE!",
-    "羊宮妃那のこもれびじかん": "羊宮妃那のこもれびじかん",
-    "HOOOOPE": "HOOOOPE",
-    "こもれびじかん": "こもれびじかん",
-}
-
-
-def load_glossary() -> dict:
-    """讀取專有名詞對照表（glossary.json）。
-
-    格式：{"日文詞": "希望顯示的中文"}
-    左邊填語音辨識可能寫出來的樣子（包含聽錯的寫法，例如「陽宮ひな」），
-    右邊填正確寫法；正確寫法本身也可以列一行、左右填一樣。
-
-    這份清單只給翻譯模型參考（見 glossary_hint），不再餵給 Whisper：
-    實測當 Whisper 提示詞時，名字雖然比較容易拼對，但會讓它整句漏聽，
-    名單跟當下內容無關時還會憑空冒出名字；聽錯的名字改由翻譯時修正。
-    """
-    if not GLOSSARY_PATH.exists():
-        with open(GLOSSARY_PATH, "w", encoding="utf-8") as f:
-            json.dump(_DEFAULT_GLOSSARY, f, ensure_ascii=False, indent=2)
-        print(f"已建立專有名詞對照表：{GLOSSARY_PATH}（可以自己編輯增減）")
-        return dict(_DEFAULT_GLOSSARY)
-
-    try:
-        with open(GLOSSARY_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            raise ValueError("glossary.json 格式應該是一個 {\"日文\": \"中文\"} 物件")
-    except (json.JSONDecodeError, OSError, ValueError) as e:
-        print(f"讀取 glossary.json 失敗，改用預設內容：{e}")
-        return dict(_DEFAULT_GLOSSARY)
-
-    # 右邊不是文字的那一行（例如把幾種聽錯寫法寫成清單）沒辦法用：略過並印出怎麼改，免得以為有生效
-    glossary = {}
-    for heard, correct in data.items():
-        if not isinstance(correct, str):
-            print(
-                f"glossary.json 的 {json.dumps(heard, ensure_ascii=False)}: {json.dumps(correct, ensure_ascii=False)} "
-                "右邊不是文字，這一行已略過（一行只寫一種聽錯寫法，格式是 \"聽錯寫法\": \"正確寫法\"）"
-            )
-            continue
-        glossary[heard] = correct
-    return glossary
-
-
-def glossary_hint(glossary: dict) -> str:
-    """把專有名詞對照表變成給 LLM 看的補充說明。
-
-    同一個正確寫法的各種聽寫寫法合併成一行，例如
-    「- 羊宮妃那（聽寫可能寫成：ゆみやひな、陽宮ひな）」。
-
-    以前的寫法是「一律完全保留原文，絕對不要翻譯」，口氣太硬，模型偶爾會
-    連整句日文都照抄回來；右邊的正確寫法也沒被用到，聽錯的名字就照錯的翻。
-    實測（45 句盲評）改成溫和說明後，翻譯品質不變或略好，聽錯的名字也會
-    被修正回正確寫法。
-    """
-    if not glossary:
-        return ""
-    variants: dict[str, list[str]] = {}
-    for heard, correct in glossary.items():
-        # 也會收到沒經過 load_glossary 的對照表（例如比較工具 --glossary 直接讀的檔）
-        if not isinstance(correct, str):
-            continue
-        correct = (correct or heard or "").strip()
-        heard = (heard or "").strip()
-        if not correct:
-            continue
-        names = variants.setdefault(correct, [])
-        if heard and heard != correct and heard not in names:
-            names.append(heard)
-    if not variants:
-        return ""
-    lines = []
-    for correct in sorted(variants):
-        heard = variants[correct]
-        lines.append(f"- {correct}（聽寫可能寫成：{'、'.join(heard)}）" if heard else f"- {correct}")
-    return (
-        "補充：聽寫稿是語音辨識的結果，人名、節目名常被寫成發音相近的其他字。"
-        "以下是正確寫法，遇到發音相近的寫法時，請照正確寫法翻譯：\n" + "\n".join(lines)
-    )
-
 
 _REPEAT_RUN_RE = re.compile(r"(.{1,4}?)\1{4,}")
 
@@ -515,7 +423,7 @@ def _gemini_reply_truncated(response) -> bool:
 
 
 def _polish_with_gemini(
-    translator: "Translator", ja_lines: list[str], system_prompt: str, glossary: dict | None = None,
+    translator: "Translator", ja_lines: list[str], system_prompt: str,
 ) -> tuple[list[str], int]:
     """回傳 (整理好的段落, 重試 3 次仍不完整的批數)。失敗批數大於 0 時，呼叫端
     要保留完整錄音，不然那幾批的內容就永遠找不回來了。
@@ -542,7 +450,7 @@ def _polish_with_gemini(
             if reply:
                 result = reply
                 complete = not truncated and bilingual_pairs_acceptable(
-                    parse_bilingual_pairs(reply), batch, glossary
+                    parse_bilingual_pairs(reply), batch
                 )
                 if complete:
                     break
@@ -572,17 +480,15 @@ def _polish_with_gemini(
 def _polish_with_local_model(
 	translator: "Translator",
 	ja_lines: list[str],
-	glossary: dict | None,
 	system_prompt: str,
 ) -> list[str] | None:
 	"""Same prompts and output layout as Gemini; batches split and retry on bad replies."""
 	engine = translator.local
 	return engine.polish_bilingual(
 		ja_lines,
-		glossary=glossary,
 		system_prompt=system_prompt,
 		build_user_prompt=_rebuild_user_prompt,
-		context_prompts=lambda prev_ja, current_ja: _context_prompts(prev_ja, current_ja, glossary),
+		context_prompts=_context_prompts,
 		progress=lambda batch_no, total: print(f"  已處理第 {batch_no}/{total} 批"),
 	)
 
@@ -604,7 +510,7 @@ def _rebuild_command(wav_path: "Path") -> str:
     return f'python "{os.path.abspath(__file__)}" --rebuild "{os.path.abspath(wav_path)}"'
 
 
-def _rebuild_coverage(polished_parts: list[str], ja_lines: list[str], glossary: dict | None) -> tuple[int, int, int]:
+def _rebuild_coverage(polished_parts: list[str], ja_lines: list[str]) -> tuple[int, int, int]:
     """整份整理稿到底涵蓋了幾句：回傳 (缺少的句數, 「翻譯失敗」佔位的句數, 翻譯有問題的句數)。
 
     不分 Gemini 或本機模型，最後都用同一個標準決定能不能刪錄音。每一批送出時的檢查
@@ -616,7 +522,7 @@ def _rebuild_coverage(polished_parts: list[str], ja_lines: list[str], glossary: 
     placeholders = sum(1 for _, zh in pairs if zh.strip() == TRANSLATION_FAILED_TEXT)
     problems = sum(
         1 for ja, zh in pairs
-        if zh.strip() != TRANSLATION_FAILED_TEXT and translation_problem(zh, ja, glossary) is not None
+        if zh.strip() != TRANSLATION_FAILED_TEXT and translation_problem(zh, ja) is not None
     )
     missing = max(0, len(ja_lines) - len(pairs))
     return missing, placeholders, problems
@@ -643,7 +549,6 @@ def rebuild_transcript_from_full_audio(
     wav_path: "Path",
     asr_model: "WhisperModel",
     translator: "Translator",
-    glossary: dict | None,
     episode_title: str = "",
 ) -> "Path | None":
     """事後（沒有即時限制）用完整錄音重新整理一份逐字稿。
@@ -694,22 +599,19 @@ def rebuild_transcript_from_full_audio(
     print(f"重新辨識完成，共 {len(ja_lines)} 句，正在請翻譯模型分批整理成完整逐字稿...")
 
     system_prompt = _REBUILD_SYSTEM_PROMPT
-    hint = glossary_hint(glossary) if glossary else ""
-    if hint:
-        system_prompt += "\n" + hint
 
     translation_only = False
     failed_batches = 0
     if getattr(translator, "backend", TRANSLATION_BACKEND_GEMINI) == TRANSLATION_BACKEND_LOCAL:
         translation_only = translator.local.is_translation_only
-        polished_parts = _polish_with_local_model(translator, ja_lines, glossary, system_prompt)
+        polished_parts = _polish_with_local_model(translator, ja_lines, system_prompt)
         if polished_parts is None:
             # 服務中途停掉：保留完整錄音，之後可以重新處理
             print(f"本機模型服務無法使用，已保留完整錄音：{wav_path}")
             print(f"之後可以用這行指令重新處理：{_rebuild_command(wav_path)}")
             return None
     else:
-        polished_parts, failed_batches = _polish_with_gemini(translator, ja_lines, system_prompt, glossary)
+        polished_parts, failed_batches = _polish_with_gemini(translator, ja_lines, system_prompt)
 
     if not polished_parts:
         print(f"翻譯模型沒有回傳任何內容，略過這份整理稿，已保留完整錄音：{wav_path}")
@@ -726,7 +628,7 @@ def rebuild_transcript_from_full_audio(
             "這份逐字稿是結束播放後，用完整錄音重新辨識、翻譯模型看過完整上下文潤過的版本，"
             "準確度會比即時觀看時看到的字幕更好，內容照實呈現、沒有自己刪減。"
         )
-    missing, placeholders, problems = _rebuild_coverage(polished_parts, ja_lines, glossary)
+    missing, placeholders, problems = _rebuild_coverage(polished_parts, ja_lines)
     complete = _rebuild_is_complete(missing, placeholders, problems, len(ja_lines)) and not sparse_speech
     keep_recording = bool(failed_batches) or not complete
     if keep_recording:
@@ -1732,12 +1634,9 @@ _SYSTEM_PROMPT_BASE = (
 )
 
 
-def _context_prompts(prev_ja: str, current_ja: str, glossary: dict | None) -> tuple[str, str]:
+def _context_prompts(prev_ja: str, current_ja: str) -> tuple[str, str]:
 	"""Build the live-caption prompts shared by the Gemini and local backends."""
 	system_prompt = _SYSTEM_PROMPT_BASE
-	hint = glossary_hint(glossary) if glossary else ""
-	if hint:
-		system_prompt += "\n" + hint
 	if prev_ja:
 		user_prompt = f"前一句話（僅供參考上下文，不用翻譯）：\n{prev_ja}\n\n請翻譯這一句：\n{current_ja}"
 	else:
@@ -1781,7 +1680,7 @@ class Translator:
                 # 只有在沒有任何服務回應、且設定了 model_path 時才會真的啟動子行程；
                 # 已有服務在跑（Ontime/Ollama/自己手動啟動）一律原樣使用，不會被停掉。
                 self.llama_server = ensure_llama_server(self.local.client)
-                warmup_system, warmup_user = _context_prompts("", "こんにちは。", None)
+                warmup_system, warmup_user = _context_prompts("", "こんにちは。")
                 self.local.prepare(warmup_system, warmup_user, "こんにちは。")
             except LlamaServerError as e:
                 # 這是自動啟動設定本身的問題（路徑找不到、網址不是本機等），訊息已經
@@ -1895,19 +1794,16 @@ class Translator:
         except Exception as list_err:
             print(f"（列出可用型號也失敗了：{list_err}）")
 
-    def translate(self, text: str, glossary: dict | None = None) -> str:
+    def translate(self, text: str) -> str:
         """翻整段文字（螢幕字幕列用，可能是好幾句接在一起）"""
         if not text.strip():
             return ""
         system_prompt = _SYSTEM_PROMPT_BASE
-        hint = glossary_hint(glossary) if glossary else ""
-        if hint:
-            system_prompt += "\n" + hint
         if self.backend == TRANSLATION_BACKEND_LOCAL:
-            return self.local.translate_live(system_prompt, f"請翻譯：\n{text}", text, glossary)
+            return self.local.translate_live(system_prompt, f"請翻譯：\n{text}", text)
         return self._chat(system_prompt, f"請翻譯：\n{text}")
 
-    def translate_with_context(self, prev_ja: str, current_ja: str, glossary: dict | None = None) -> str:
+    def translate_with_context(self, prev_ja: str, current_ja: str) -> str:
         """翻「這一句」，但先讓模型看過前一句當作上下文（代名詞/省略主詞會準很多）。
 
         LLM 可以直接看懂「只翻最後一句、前面只是給你參考」這種指示，
@@ -1916,18 +1812,18 @@ class Translator:
         if not current_ja.strip():
             return ""
 
-        system_prompt, user_prompt = _context_prompts(prev_ja, current_ja, glossary)
+        system_prompt, user_prompt = _context_prompts(prev_ja, current_ja)
         if self.backend == TRANSLATION_BACKEND_LOCAL:
             # 同一組提示詞；回覆有問題（空白、照抄提示、沒翻成中文）時不帶前一句重翻一次
             return self.local.translate_live(
-                system_prompt, user_prompt, current_ja, glossary, fallback_user_prompt=f"請翻譯：\n{current_ja}"
+                system_prompt, user_prompt, current_ja, fallback_user_prompt=f"請翻譯：\n{current_ja}"
             )
         result = self._chat(system_prompt, user_prompt)
-        if result and translation_problem(result, current_ja, glossary) == "untranslated":
+        if result and translation_problem(result, current_ja) == "untranslated":
             # Gemini 偶爾會把日文原文照抄回來（中文字幕變成日文）；不帶前一句、
             # 用最單純的提示再翻一次，還是沒翻成中文的話就照原本的結果顯示
             retry = self._chat(system_prompt, f"請把這一句翻成繁體中文：\n{current_ja}")
-            if retry and translation_problem(retry, current_ja, glossary) is None:
+            if retry and translation_problem(retry, current_ja) is None:
                 return retry
         return result
 
@@ -1961,17 +1857,12 @@ class Worker(threading.Thread):
         self._stop_event = threading.Event()
 
         # 用來偵測 Whisper 卡進「幻覺迴圈」：音訊有雜音/glitch 時，有時候會連續
-        # 辨識出同一句幾乎一模一樣的短句（常常剛好是提示詞裡的專有名詞），而且
+        # 辨識出同一句幾乎一模一樣的短句，而且
         # 速度很快，會把逐字稿視窗瞬間灌爆、UI 整個卡死
         self._recent_ja_texts = deque(maxlen=4)
         self._hallucination_loop_warned = False
 
         self.prev_ja = ""  # 只看前一句當上下文，用來讓翻譯知道代名詞/省略主詞指的是誰
-
-        # 專有名詞清單只給翻譯模型參考，不當 Whisper 的提示詞（原因見 load_glossary）
-        self.glossary = load_glossary()
-        if self.glossary:
-            print(f"已載入 {len(self.glossary)} 個專有名詞：{'、'.join(self.glossary.keys())}")
 
         date_str = date_str or datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         self.log_path = TRANSCRIPT_DIR / f"transcript_{date_str}.txt"
@@ -2059,7 +1950,7 @@ class Worker(threading.Thread):
         # 逐字稿面板、畫面下方字幕列都用同一份結果，不用多算一次
         # （字幕列以前會把最近幾句接起來整段重翻，除了拖慢速度，塞太多字
         # 也會把固定高度的字幕區撐爆，所以改成只顯示當下這一句就好）
-        zh_final = self.translator.translate_with_context(self.prev_ja, ja_text, self.glossary)
+        zh_final = self.translator.translate_with_context(self.prev_ja, ja_text)
         self.prev_ja = ja_text
         self.transcript_queue.put((release_at, ja_text, zh_final))
         self.caption_queue.put((release_at, ja_text, zh_final))
@@ -2654,7 +2545,7 @@ def main():
         else:
             try:
                 notebooklm_style_path = rebuild_transcript_from_full_audio(
-                    raw_audio_path, worker.asr, worker.translator, worker.glossary, episode_title
+                    raw_audio_path, worker.asr, worker.translator, episode_title
                 )
             except Exception as e:
                 notebooklm_style_path = None
@@ -2695,7 +2586,6 @@ def rebuild_saved_recording(wav_path: Path) -> "Path | None":
     try:
         print("載入語音辨識模型（Whisper，第一次執行會自動下載）...")
         asr = WhisperModel(WHISPER_MODEL_SIZE, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE_TYPE)
-        glossary = load_glossary()
 
         # 節目名稱沿用同一場的原始逐字稿第一行（#TITLE:），重新整理後的標題才會跟原本一樣
         raw_log_path = wav_path.with_name(wav_path.stem.replace("_audio", "") + ".txt")
@@ -2709,7 +2599,7 @@ def rebuild_saved_recording(wav_path: Path) -> "Path | None":
             except (OSError, UnicodeError) as e:
                 print(f"讀取 {raw_log_path.name} 的節目名稱失敗，改用預設標題：{e}")
 
-        out_path = rebuild_transcript_from_full_audio(wav_path, asr, translator, glossary, episode_title)
+        out_path = rebuild_transcript_from_full_audio(wav_path, asr, translator, episode_title)
     except Exception as e:
         print(f"用完整錄音重新整理逐字稿時發生錯誤：{e}")
         if wav_path.exists():

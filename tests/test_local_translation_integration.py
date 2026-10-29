@@ -200,7 +200,7 @@ class TranslationBackendTestCase(unittest.TestCase):
 		self.addCleanup(temp_dir.cleanup)
 		wav_path = Path(temp_dir.name) / "transcript_20260926_010203_audio.wav"
 		wav_path.write_bytes(b"RIFF")
-		out_path = self.app.rebuild_transcript_from_full_audio(wav_path, asr, translator, {"田中": "田中"}, "節目")
+		out_path = self.app.rebuild_transcript_from_full_audio(wav_path, asr, translator, "節目")
 		return out_path, wav_path
 
 
@@ -210,11 +210,11 @@ class GeminiPathTests(TranslationBackendTestCase):
 		calls = install_fake_gemini(lambda contents, n: "  請多指教。  ")
 		translator = self.app.Translator()
 		self.assertEqual(translator.backend, "gemini")
-		self.assertEqual(translator.translate_with_context("田中です。", "よろしく。", {"田中": "田中"}), "請多指教。")
+		self.assertEqual(translator.translate_with_context("田中です。", "よろしく。"), "請多指教。")
 		self.assertEqual(calls, [{
 			"model": self.app.GEMINI_MODEL,
 			"contents": "前一句話（僅供參考上下文，不用翻譯）：\n田中です。\n\n請翻譯這一句：\nよろしく。",
-			"system_instruction": MASTER_LIVE_SYSTEM_PROMPT + "\n" + self.app.glossary_hint({"田中": "田中"}),
+			"system_instruction": MASTER_LIVE_SYSTEM_PROMPT,
 			"temperature": 0.3,
 		}])
 
@@ -344,7 +344,7 @@ class GeminiPathTests(TranslationBackendTestCase):
 			"日文0です。\n譯文0\n\n日文1です。\n（翻譯失敗）",
 			"日文2です。\nこれは翻訳されていないです",  # still Japanese: a translation problem
 		]
-		self.assertEqual(self.app._rebuild_coverage(parts, lines, None), (2, 1, 1))
+		self.assertEqual(self.app._rebuild_coverage(parts, lines), (2, 1, 1))
 
 	def test_join_thread_reports_whether_the_thread_really_finished(self):
 		import threading
@@ -413,10 +413,10 @@ class SparseRebuildSpeechTests(TranslationBackendTestCase):
 		translator, calls = self.gemini_translator(lambda contents, n: bilingual_reply(contents, "中文"))
 		with mock.patch.object(self.app, "ASMR_MODE", asmr):
 			if read_error is None:
-				out_path = self.app.rebuild_transcript_from_full_audio(wav_path, asr, translator, None)
+				out_path = self.app.rebuild_transcript_from_full_audio(wav_path, asr, translator)
 			else:
 				with mock.patch.object(self.app.wave, "open", side_effect=read_error):
-					out_path = self.app.rebuild_transcript_from_full_audio(wav_path, asr, translator, None)
+					out_path = self.app.rebuild_transcript_from_full_audio(wav_path, asr, translator)
 		self.assertEqual(asr.transcribe.call_args.kwargs["vad_filter"], not asmr)
 		return out_path, wav_path, calls
 
@@ -471,10 +471,9 @@ class PromptParityTests(TranslationBackendTestCase):
 	def test_live_caption_prompts_are_identical(self):
 		translator, calls = self.gemini_translator(lambda contents, n: "請多指教。")
 		local, client = self.local_translator(lambda system, user: "請多指教。")
-		glossary = {"羊宮妃那": "羊宮妃那", "ゆみやひな": "羊宮妃那"}
 		for prev_ja in ("", "田中です。"):
-			translator.translate_with_context(prev_ja, "よろしくお願いします。", glossary)
-			local.translate_with_context(prev_ja, "よろしくお願いします。", glossary)
+			translator.translate_with_context(prev_ja, "よろしくお願いします。")
+			local.translate_with_context(prev_ja, "よろしくお願いします。")
 		self.assertEqual([(call["system_instruction"], call["contents"]) for call in calls], client.calls)
 
 	def test_reconstruction_prompts_are_identical(self):
@@ -589,7 +588,7 @@ class LocalBackendTests(TranslationBackendTestCase):
 		text = out_path.read_text(encoding="utf-8")
 		self.assertIn("本機翻譯專用模型逐句翻譯", text)
 		self.assertIn("日文です。\n中文。\n\n田中です。\n中文。", text)
-		self.assertEqual(client.calls[1], ("", "Translate this into Traditional Chinese: __GLOSSARY_0__です。"))
+		self.assertEqual(client.calls[1], ("", "Translate this into Traditional Chinese: 田中です。"))
 
 
 
@@ -608,68 +607,15 @@ class WhisperModelConfigTests(TranslationBackendTestCase):
 		self.assertEqual(self.app.resolve_whisper_model_size(True, environ={"WHISPER_MODEL": "   "}), "large-v3")
 
 
-class GlossaryFileTests(TranslationBackendTestCase):
-	def test_glossary_hint_skips_values_that_are_not_strings(self):
-		valid = {"陽宮ひな": "羊宮妃那", "HOOOOPE": "HOOOOPE", "鈴木": ""}
-		for value in (["ゆみやひな", "陽宮ひな"], 1, True, {"正確寫法": "こもれびじかん"}, None):
-			with self.subTest(value=value):
-				hint = self.app.glossary_hint({**valid, "こもれびじかん": value})
-				self.assertEqual(hint, self.app.glossary_hint(valid))
-				self.assertIn("- 羊宮妃那（聽寫可能寫成：陽宮ひな）", hint)
-				self.assertIn("- 鈴木\n", hint + "\n")
-				self.assertEqual(self.app.glossary_hint({"こもれびじかん": value}), "")
-		self.assertEqual(self.app.glossary_hint({"": ""}), "")
-
-	def test_load_glossary_skips_and_reports_values_that_are_not_strings(self):
-		valid = {"ようみやひな": "羊宮妃那", "ホープ": "HOOOOPE", "鈴木": ""}
-		invalid = {"羊宮妃那": ["ゆみやひな", "陽宮ひな"], "HOOOOPE": 1, "こもれびじかん": True, "番組": {"正確寫法": "ばんぐみ"}, "田中": None}
-		with tempfile.TemporaryDirectory() as temp_dir:
-			path = Path(temp_dir) / "glossary.json"
-			path.write_text(json.dumps({**valid, **invalid}, ensure_ascii=False, indent=2), encoding="utf-8")
-			with mock.patch.object(self.app, "GLOSSARY_PATH", path):
-				glossary = self.app.load_glossary()
-		self.assertEqual(glossary, valid)
-		lines = self.printed_text().splitlines()
-		for key, value in invalid.items():
-			with self.subTest(key=key):
-				self.assertTrue(any(key in line and json.dumps(value, ensure_ascii=False) in line and '"聽錯寫法": "正確寫法"' in line for line in lines), lines)
-		for key in valid:
-			self.assertNotIn(key, self.printed_text())
-
-	def test_live_caption_still_translates_when_a_glossary_value_is_not_a_string(self):
-		# Worker.run calls translate_with_context with no try around it, so a raise here would
-		# stop the captions for the rest of the session.
-		translator, calls = self.gemini_translator(lambda contents, n: "羊宮妃那來了。")
-		glossary = {"陽宮ひな": "羊宮妃那", "羊宮妃那": ["ゆみやひな", "陽宮ひな"], "HOOOOPE": 1}
-		self.assertEqual(translator.translate_with_context("", "陽宮ひなが来ました。", glossary), "羊宮妃那來了。")
-		self.assertEqual(len(calls), 1)
-		self.assertIn("- 羊宮妃那（聽寫可能寫成：陽宮ひな）", calls[0]["system_instruction"])
-
-	def test_load_glossary_recreates_the_default_file_when_missing(self):
-		# glossary.json is now gitignored (a user's own list should not conflict with git
-		# pull); a fresh clone must still work by falling back to _DEFAULT_GLOSSARY.
-		with tempfile.TemporaryDirectory() as temp_dir:
-			missing_path = Path(temp_dir) / "glossary.json"
-			with mock.patch.object(self.app, "GLOSSARY_PATH", missing_path):
-				glossary = self.app.load_glossary()
-			self.assertEqual(glossary, self.app._DEFAULT_GLOSSARY)
-			self.assertTrue(missing_path.exists())
-			self.assertEqual(json.loads(missing_path.read_text(encoding="utf-8")), self.app._DEFAULT_GLOSSARY)
-
-	def test_glossary_hint_groups_misheard_spellings_under_the_correct_name(self):
-		hint = self.app.glossary_hint({"羊宮妃那": "羊宮妃那", "ゆみやひな": "羊宮妃那", "陽宮ひな": "羊宮妃那", "HOOOOPE": "HOOOOPE"})
-		self.assertIn("- 羊宮妃那（聽寫可能寫成：ゆみやひな、陽宮ひな）", hint)
-		self.assertIn("- HOOOOPE\n", hint + "\n")
-		self.assertNotIn("完全保留原文", hint)
-
-	def test_glossary_is_not_used_as_a_whisper_prompt(self):
+class WhisperPromptTests(TranslationBackendTestCase):
+	def test_whisper_uses_no_initial_prompt(self):
 		translator, _ = self.gemini_translator(lambda contents, n: "中文")
 		asr = mock.Mock()
 		asr.transcribe.return_value = ([FakeSegment(0, "田中です。")], None)
 		with tempfile.TemporaryDirectory() as temp_dir:
 			wav_path = Path(temp_dir) / "transcript_20260926_010203_audio.wav"
 			wav_path.write_bytes(b"RIFF")
-			self.app.rebuild_transcript_from_full_audio(wav_path, asr, translator, {"田中": "田中"}, "節目")
+			self.app.rebuild_transcript_from_full_audio(wav_path, asr, translator, "節目")
 		self.assertIsNone(asr.transcribe.call_args.kwargs.get("initial_prompt"))
 
 
@@ -973,7 +919,6 @@ class WorkflowWiringTests(TranslationBackendTestCase):
 	def test_worker_reuses_injected_translator_without_constructing_another(self):
 		injected = mock.Mock()
 		with mock.patch.object(self.app, "Translator") as translator_class, \
-				mock.patch.object(self.app, "load_glossary", return_value={}), \
 				tempfile.TemporaryDirectory() as temp_dir, \
 				mock.patch.object(self.app, "TRANSCRIPT_DIR", Path(temp_dir)):
 			worker = self.app.Worker(queue.Queue(), queue.Queue(), queue.Queue(), translator=injected)
@@ -991,8 +936,7 @@ class WorkflowWiringTests(TranslationBackendTestCase):
 		translator = mock.Mock()
 		translator.translate_with_context.return_value = "這是會這樣做下去的節目。"
 		utterances, captions = queue.Queue(), queue.Queue()
-		with mock.patch.object(self.app, "load_glossary", return_value={}), \
-				tempfile.TemporaryDirectory() as temp_dir, \
+		with tempfile.TemporaryDirectory() as temp_dir, \
 				mock.patch.object(self.app, "TRANSCRIPT_DIR", Path(temp_dir)):
 			worker = self.app.Worker(utterances, captions, queue.Queue(), translator=translator)
 			worker.asr = mock.Mock()
@@ -1015,8 +959,7 @@ class WorkflowWiringTests(TranslationBackendTestCase):
 		translator = mock.Mock()
 		translator.translate_with_context.return_value = "請多指教"
 		utterances, captions = queue.Queue(), queue.Queue()
-		with mock.patch.object(self.app, "load_glossary", return_value={}), \
-				tempfile.TemporaryDirectory() as temp_dir, \
+		with tempfile.TemporaryDirectory() as temp_dir, \
 				mock.patch.object(self.app, "TRANSCRIPT_DIR", Path(temp_dir)), \
 				mock.patch("builtins.print") as printed:
 			worker = self.app.Worker(utterances, captions, queue.Queue(), translator=translator)
@@ -1113,14 +1056,13 @@ class SavedRecordingRebuildTests(TranslationBackendTestCase):
 		"""Run rebuild_saved_recording with the models and the rebuild step itself mocked out."""
 		with mock.patch.object(self.app, "Translator", side_effect=translator_error) as translator_class, \
 				mock.patch.object(self.app, "WhisperModel", side_effect=whisper_error) as whisper_class, \
-				mock.patch.object(self.app, "load_glossary", return_value={"田中": "田中"}), \
 				mock.patch.object(
 					self.app, "rebuild_transcript_from_full_audio", return_value=Path("out.md"), side_effect=rebuild_error
 				) as rebuild:
 			result = self.app.rebuild_saved_recording(wav_path)
 		return result, translator_class, whisper_class, rebuild
 
-	def test_rebuild_uses_the_backend_main_would_pick_the_glossary_and_the_episode_title(self):
+	def test_rebuild_uses_the_backend_main_would_pick_and_the_episode_title(self):
 		cases = (
 			({"TRANSLATION_BACKEND": "local"}, {"translation_backend": "gemini"}, "local"),
 			({}, {"translation_backend": "local"}, "local"),
@@ -1137,13 +1079,13 @@ class SavedRecordingRebuildTests(TranslationBackendTestCase):
 					self.app.WHISPER_MODEL_SIZE, device=self.app.WHISPER_DEVICE, compute_type=self.app.WHISPER_COMPUTE_TYPE
 				)
 				rebuild.assert_called_once_with(
-					wav_path, whisper_class.return_value, translator_class.return_value, {"田中": "田中"}, "節目"
+					wav_path, whisper_class.return_value, translator_class.return_value, "節目"
 				)
 		self.assertIn("改用 Gemini API", self.printed_text())
 
 	def test_rebuild_without_the_raw_transcript_has_no_episode_title(self):
 		_, _, _, rebuild = self.rebuild_saved(self.saved_recording(title=None))
-		self.assertEqual(rebuild.call_args.args[4], "")
+		self.assertEqual(rebuild.call_args.args[3], "")
 
 	def test_unreadable_raw_transcript_still_rebuilds_without_an_episode_title(self):
 		wav_path = self.saved_recording(title=None)
@@ -1152,7 +1094,7 @@ class SavedRecordingRebuildTests(TranslationBackendTestCase):
 		result, translator_class, whisper_class, rebuild = self.rebuild_saved(wav_path)
 		self.assertEqual(result, Path("out.md"))
 		rebuild.assert_called_once_with(
-			wav_path, whisper_class.return_value, translator_class.return_value, {"田中": "田中"}, ""
+			wav_path, whisper_class.return_value, translator_class.return_value, ""
 		)
 		self.assertRegex(self.printed_text(), r"讀取 transcript_20260926_010203\.txt 的節目名稱失敗，改用預設標題：.*can't decode")
 		self.assertNotIn("用完整錄音重新整理逐字稿時發生錯誤", self.printed_text())

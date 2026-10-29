@@ -17,7 +17,7 @@ class FakeTranslator:
 		self.calls = []
 		self.judge_prompts = []
 
-	def translate_with_context(self, prev_ja, current_ja, glossary=None):
+	def translate_with_context(self, prev_ja, current_ja):
 		self.calls.append((prev_ja, current_ja))
 		return self.mapping.get(current_ja, "")
 
@@ -53,11 +53,6 @@ class HelperTests(unittest.TestCase):
 		self.assertEqual(compare.chrf("甲乙丙", "丁戊己"), 0.0)
 		self.assertTrue(0 < compare.chrf("今天天氣不錯", "今天天氣很好") < 100)
 
-	def test_glossary_expectations_use_display_text_and_longest_terms(self):
-		glossary = {"羊宮妃那": "羊宮妃那", "羊宮妃那のHOOOOPE!": "羊宮妃那のHOOOOPE!", "ゆみやひな": "羊宮妃那"}
-		self.assertEqual(compare.glossary_expectations("羊宮妃那のHOOOOPE!です", glossary), ["羊宮妃那のHOOOOPE!"])
-		self.assertEqual(compare.glossary_expectations("ゆみやひなです", glossary), ["羊宮妃那"])
-
 	def test_wilson_lower_bound_is_conservative(self):
 		self.assertLess(compare.wilson_lower_bound(0.6, 10), 0.6)
 		self.assertGreater(compare.wilson_lower_bound(0.6, 1000), 0.55)
@@ -81,7 +76,6 @@ class MainTests(unittest.TestCase):
 		self.addCleanup(self.temp_dir.cleanup)
 		self.samples = Path(self.temp_dir.name) / "samples.txt"
 		self.samples.write_text("ゆみやひなです。\n今日はいい天気ですね。\nまたね。\n", encoding="utf-8")
-		self.glossary = {"ゆみやひな": "羊宮妃那"}
 		printer = mock.patch("builtins.print")
 		printer.start()
 		self.addCleanup(printer.stop)
@@ -93,7 +87,6 @@ class MainTests(unittest.TestCase):
 		code = compare.main(
 			[str(self.samples), "--out", str(out), "--json", str(json_path), *extra],
 			translator_factory=lambda name: translators[name],
-			glossary_loader=lambda: self.glossary,
 			sleep=sleeps.append,
 		)
 		return code, out.read_text(encoding="utf-8"), json.loads(json_path.read_text(encoding="utf-8")), sleeps
@@ -105,7 +98,6 @@ class MainTests(unittest.TestCase):
 		self.assertEqual(code, 0)
 		self.assertIn("PASS", report)
 		self.assertEqual(result["judge"]["judged"], 3)
-		self.assertEqual(result["summaries"]["local"]["glossary_rate"], 1.0)
 		self.assertEqual(gemini.calls[1], ("ゆみやひなです。", "今日はいい天気ですね。"))
 		self.assertEqual(sleeps, [4.5, 4.5, 4.5, 4.5])
 		self.assertIn("| 1 | ゆみやひなです。 | 我是羊宮妃那。 | 我是羊宮妃那。 | 平手 |", report)
@@ -118,13 +110,6 @@ class MainTests(unittest.TestCase):
 		self.assertIn("FAIL", report)
 		self.assertEqual(result["summaries"]["local"]["problems"], {"untranslated": 1})
 
-	def test_glossary_miss_fails_gate(self):
-		gemini = FakeTranslator("gemini", {"ゆみやひなです。": "我是羊宮妃那。", "今日はいい天気ですね。": "今天天氣真好。", "またね。": "再見。"})
-		local = FakeTranslator("local", {"ゆみやひなです。": "我是弓矢雛。", "今日はいい天気ですね。": "今天天氣真好。", "またね。": "再見。"})
-		code, _, result, _ = self.run_main({"gemini": gemini, "local": local}, "--gemini-interval", "0")
-		self.assertEqual(code, 1)
-		self.assertFalse(result["gate"]["passed"])
-
 	def test_local_only_smoke_run_needs_no_gemini(self):
 		local = FakeTranslator("local", {"ゆみやひなです。": "我是羊宮妃那。", "今日はいい天気ですね。": "今天天氣真好。", "またね。": "再見。"})
 		code, report, result, sleeps = self.run_main({"local": local}, "--backends", "local")
@@ -134,7 +119,7 @@ class MainTests(unittest.TestCase):
 		self.assertNotIn("結論", report)
 
 	def test_judge_requires_both_backends(self):
-		self.assertEqual(compare.main([str(self.samples), "--backends", "local", "--judge"], translator_factory=lambda name: None, glossary_loader=dict), 2)
+		self.assertEqual(compare.main([str(self.samples), "--backends", "local", "--judge"], translator_factory=lambda name: None), 2)
 
 
 if __name__ == "__main__":
