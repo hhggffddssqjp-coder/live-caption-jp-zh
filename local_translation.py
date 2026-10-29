@@ -11,7 +11,7 @@ the guard rails a smaller model needs to deliver the same results:
 - a circuit breaker so a stopped server fails fast instead of stalling captions or jobs.
 
 Translation-only models (Riva-Translate) cannot follow those instructions, so the ``riva``
-profile uses Ontime's plain per-sentence prompt, masks glossary terms and splits long input.
+profile uses Ontime's plain per-sentence prompt and splits long input.
 Prompts and model output are never logged.
 """
 
@@ -19,7 +19,6 @@ import math
 import os
 import re
 import time
-from collections import Counter
 from dataclasses import dataclass
 
 from local_llm import MODE_RIVA, RIVA_TRANSLATION_INSTRUCTION, LocalLLMClient, LocalLLMError
@@ -36,7 +35,6 @@ _LINE_LABEL_RE = re.compile(
 	r"^\s*(?:[-*]\s*)?(?:日文原句|日文|中文翻譯|中文|原文|譯文|翻譯|日本語|JA|JP|ZH)\s*[：:]\s*",
 	re.IGNORECASE,
 )
-_GLOSSARY_MARKER_RE = re.compile(r"__GLOSSARY_\d+__")
 _SENTENCE_BREAK_RE = re.compile(r"(?<=[。！？!?…\n])")
 _CLAUSE_BREAK_RE = re.compile(r"(?<=[、，,])")
 
@@ -64,28 +62,14 @@ def _env_number(value, env_name: str, default, parse, *, allow_zero: bool = Fals
 
 # ---------- text checks ----------
 
-def _glossary_terms(glossary: dict | None) -> list[str]:
-	terms = set()
-	for key, value in (glossary or {}).items():
-		for term in (key, value):
-			if isinstance(term, str) and term.strip():
-				terms.add(term)
-	return sorted(terms, key=len, reverse=True)
-
-
-def translation_problem(text: str, source: str, glossary: dict | None = None) -> str | None:
+def translation_problem(text: str, source: str) -> str | None:
 	"""Return why ``text`` is not a usable Chinese rendering of ``source``, or None."""
 	if not isinstance(text, str) or not text.strip():
 		return "empty"
 	if any(marker in text for marker in _PROMPT_ECHO_MARKERS):
 		return "echo"
-	if _GLOSSARY_MARKER_RE.search(text):
-		return "marker"
-	body = text
-	for term in _glossary_terms(glossary):
-		body = body.replace(term, "")
-	kana = len(_KANA_RE.findall(body))
-	cjk = len(_CJK_RE.findall(body))
+	kana = len(_KANA_RE.findall(text))
+	cjk = len(_CJK_RE.findall(text))
 	if kana >= 3 and kana > cjk:
 		return "untranslated"
 	if len(text) > 4 * len(source.strip()) + 40:
@@ -124,83 +108,17 @@ def parse_bilingual_pairs(text: str) -> list[tuple[str, str]]:
 	return pairs
 
 
-def bilingual_pairs_acceptable(pairs: list[tuple[str, str]], batch: list[str], glossary: dict | None) -> bool:
+def bilingual_pairs_acceptable(pairs: list[tuple[str, str]], batch: list[str]) -> bool:
 	"""Accept a reply that covers the batch; ASR correction may merge or split a few lines."""
 	count = len(batch)
 	if not pairs or len(pairs) < max(1, math.ceil(count * 0.75)) or len(pairs) > 2 * count + 2:
 		return False
-	bad = sum(1 for ja, zh in pairs if not ja.strip() or translation_problem(zh, ja, glossary) is not None)
+	bad = sum(1 for ja, zh in pairs if not ja.strip() or translation_problem(zh, ja) is not None)
 	return bad <= count // 10
 
 
-# ---------- glossary protection for translation-only models ----------
-
-@dataclass
-class MaskedText:
-	text: str
-	targets: dict
-	expected: Counter
-
-
-def mask_glossary(text: str, glossary: dict | None) -> MaskedText:
-	"""Replace glossary source terms with atomic markers, longest term first."""
-	terms = sorted((term for term in (glossary or {}) if isinstance(term, str) and term), key=len, reverse=True)
-	if not terms or "__GLOSSARY_" in text:
-		return MaskedText(text, {}, Counter())
-	pattern = re.compile("|".join(re.escape(term) for term in terms))
-	markers = {}
-	targets = {}
-
-	def replace(match):
-		term = match.group(0)
-		marker = markers.setdefault(term, f"__GLOSSARY_{len(markers)}__")
-		target = glossary.get(term)
-		targets[marker] = target if isinstance(target, str) and target.strip() else term
-		return marker
-
-	masked = pattern.sub(replace, text)
-	return MaskedText(masked, targets, Counter(_GLOSSARY_MARKER_RE.findall(masked)))
-
-
-def restore_glossary(translated: str, masked: MaskedText) -> str | None:
-	"""Put configured targets back; None when a marker was lost, duplicated or invented."""
-	if not masked.targets:
-		return translated
-	if Counter(_GLOSSARY_MARKER_RE.findall(translated)) != masked.expected:
-		return None
-	return _GLOSSARY_MARKER_RE.sub(lambda match: masked.targets[match.group(0)], translated)
-
-
-def apply_glossary_targets(text: str, glossary: dict | None) -> str:
-	"""Map source terms the model kept verbatim to their configured display text."""
-	for term in sorted((key for key in (glossary or {}) if isinstance(key, str) and key), key=len, reverse=True):
-		target = glossary.get(term)
-		if isinstance(target, str) and target.strip() and target != term:
-			text = text.replace(term, target)
-	return text
-
-
-def _protected_spans(text: str, glossary: dict | None) -> list[tuple[int, int]]:
-	spans = []
-	for term in _glossary_terms({key: key for key in (glossary or {})}):
-		start = text.find(term)
-		while start >= 0:
-			spans.append((start, start + len(term)))
-			start = text.find(term, start + 1)
-	return spans
-
-
-def _safe_cut(text: str, limit: int, glossary: dict | None) -> int:
-	"""Largest cut position <= limit that does not split a glossary term."""
-	cut = limit
-	for start, end in _protected_spans(text, glossary):
-		if start < cut < end:
-			cut = start if start > 0 else end
-	return max(1, cut)
-
-
-def split_for_translation(text: str, max_chars: int, glossary: dict | None = None) -> list[str]:
-	"""Split long input at sentence, clause, then size boundaries, keeping glossary terms whole."""
+def split_for_translation(text: str, max_chars: int) -> list[str]:
+	"""依序按句子、子句與長度切分較長的輸入。"""
 	text = text.strip()
 	if len(text) <= max_chars:
 		return [text] if text else []
@@ -211,7 +129,7 @@ def split_for_translation(text: str, max_chars: int, glossary: dict | None = Non
 			continue
 		for clause in (part for part in _CLAUSE_BREAK_RE.split(sentence) if part.strip()):
 			while len(clause) > max_chars:
-				cut = _safe_cut(clause, max_chars, glossary)
+				cut = max(1, max_chars)
 				pieces.append(clause[:cut])
 				clause = clause[cut:]
 			if clause.strip():
@@ -315,7 +233,7 @@ class LocalTranslationEngine:
 				self.log(f"提醒：本機模型 context 只有 {n_ctx}，事後整理會自動改用較小批次；建議用 -c 8192 以上啟動。")
 		started = self.clock()
 		if self.is_translation_only:
-			sample = self._plain_translate(warmup_source, None, timeout=self.client.timeout, batch=False)
+			sample = self._plain_translate(warmup_source, timeout=self.client.timeout, batch=False)
 		else:
 			sample = self.postprocess(self.client.chat(warmup_system_prompt, warmup_user_prompt, timeout=self.client.timeout))
 		self.log(f"本機模型已就緒（暖機 {self.clock() - started:.1f} 秒）：{warmup_source} → {sample}")
@@ -339,7 +257,6 @@ class LocalTranslationEngine:
 		system_prompt: str,
 		user_prompt: str,
 		source: str,
-		glossary: dict | None,
 		fallback_user_prompt: str | None = None,
 	) -> str:
 		"""Translate one caption; repair a bad reply once without the context sentence."""
@@ -347,26 +264,26 @@ class LocalTranslationEngine:
 			if self.clock() < self._live_paused_until:
 				return ""
 			try:
-				text = self._plain_translate(source, glossary, timeout=self.live_timeout, batch=False)
+				text = self._plain_translate(source, timeout=self.live_timeout, batch=False)
 			except LocalLLMError as error:
 				self._live_failed(error)
 				return ""
 			self._live_succeeded()
-			return text if translation_problem(text, source, glossary) is None else ""
+			return text if translation_problem(text, source) is None else ""
 		first = self.live_chat(system_prompt, user_prompt)
-		problem = translation_problem(first, source, glossary) or self._context_leak(first)
+		problem = translation_problem(first, source) or self._context_leak(first)
 		if problem is None:
 			return self._remember(first)
 		if not first and (self.last_error is None or self.last_error.unreachable):
 			# The server is slow or gone; a second request would only delay later captions.
 			return ""
 		if fallback_user_prompt is None:
-			return self._remember(first) if problem not in ("echo", "marker") else ""
+			return self._remember(first) if problem != "echo" else ""
 		second = self.live_chat(system_prompt, fallback_user_prompt)
-		if translation_problem(second, source, glossary) is None:
+		if translation_problem(second, source) is None:
 			return self._remember(second)
 		# Prefer a non-empty first reply over a blank caption unless it echoed the prompt.
-		return self._remember(first) if first and problem not in ("echo", "marker") else ""
+		return self._remember(first) if first and problem != "echo" else ""
 
 	def _context_leak(self, text: str) -> str | None:
 		"""Detect a reply that re-translated the context sentence in front of the current one."""
@@ -447,7 +364,7 @@ class LocalTranslationEngine:
 			budget = min(budget, max(256, n_ctx // 2))
 		return budget
 
-	def _line_with_context(self, index: int, lines: list[str], glossary: dict | None, context_prompts) -> str:
+	def _line_with_context(self, index: int, lines: list[str], context_prompts) -> str:
 		"""Translate one line with the live-caption prompts; "" when the reply is unusable."""
 		previous = lines[index - 1] if index > 0 else ""
 		system_prompt, user_prompt = context_prompts(previous, lines[index])
@@ -457,7 +374,7 @@ class LocalTranslationEngine:
 			raise
 		except LocalLLMError:
 			return ""
-		return text if translation_problem(text, lines[index], glossary) is None else ""
+		return text if translation_problem(text, lines[index]) is None else ""
 
 	# ---------- translation-only (Riva) profile ----------
 
@@ -467,41 +384,35 @@ class LocalTranslationEngine:
 			return self.batch_chat("", user_prompt)
 		return self.postprocess(self.client.chat("", user_prompt, timeout=timeout)).strip()
 
-	def _plain_segment(self, segment: str, glossary: dict | None, *, timeout: float, batch: bool, depth: int = 0) -> str:
-		masked = mask_glossary(segment, glossary)
+	def _plain_segment(self, segment: str, *, timeout: float, batch: bool, depth: int = 0) -> str:
 		try:
-			raw = self._plain_call(masked.text, timeout=timeout, batch=batch)
+			return self._plain_call(segment, timeout=timeout, batch=batch)
 		except LocalLLMError as error:
 			if error.too_large and depth < 4 and len(segment) > 20:
-				cut = _safe_cut(segment, len(segment) // 2, glossary)
+				cut = len(segment) // 2
 				return (
-					self._plain_segment(segment[:cut], glossary, timeout=timeout, batch=batch, depth=depth + 1)
-					+ self._plain_segment(segment[cut:], glossary, timeout=timeout, batch=batch, depth=depth + 1)
+					self._plain_segment(segment[:cut], timeout=timeout, batch=batch, depth=depth + 1)
+					+ self._plain_segment(segment[cut:], timeout=timeout, batch=batch, depth=depth + 1)
 				)
 			raise
-		restored = restore_glossary(raw, masked)
-		if restored is None:
-			# The model lost or duplicated a marker: translate unmasked and map the terms afterwards.
-			restored = apply_glossary_targets(self._plain_call(segment, timeout=timeout, batch=batch), glossary)
-		return restored
 
-	def _plain_translate(self, text: str, glossary: dict | None, *, timeout: float, batch: bool) -> str:
+	def _plain_translate(self, text: str, *, timeout: float, batch: bool) -> str:
 		pieces = [
-			self._plain_segment(segment, glossary, timeout=timeout, batch=batch)
-			for segment in split_for_translation(text, self.segment_chars, glossary)
+			self._plain_segment(segment, timeout=timeout, batch=batch)
+			for segment in split_for_translation(text, self.segment_chars)
 		]
 		return "".join(pieces)
 
-	def _plain_line(self, text: str, glossary: dict | None) -> str:
+	def _plain_line(self, text: str) -> str:
 		if not text.strip():
 			return ""
 		try:
-			translated = self._plain_translate(text, glossary, timeout=self.client.timeout, batch=True)
+			translated = self._plain_translate(text, timeout=self.client.timeout, batch=True)
 		except LocalServiceUnavailable:
 			raise
 		except LocalLLMError:
 			return ""
-		return translated if translation_problem(translated, text, glossary) is None else ""
+		return translated if translation_problem(translated, text) is None else ""
 
 	# ---------- numbered batches (offline pre-transcription) ----------
 
@@ -509,7 +420,6 @@ class LocalTranslationEngine:
 		self,
 		texts: list[str],
 		*,
-		glossary: dict | None,
 		system_prompt: str,
 		build_user_prompt,
 		parse_numbered,
@@ -527,10 +437,10 @@ class LocalTranslationEngine:
 				indices = list(range(start, min(start + self.batch_lines, len(texts))))
 				if self.is_translation_only:
 					for index in indices:
-						results[index] = self._plain_line(texts[index], glossary)
+						results[index] = self._plain_line(texts[index])
 				else:
 					self._numbered_chunk(
-						indices, texts, results, glossary, system_prompt, build_user_prompt,
+						indices, texts, results, system_prompt, build_user_prompt,
 						parse_numbered, context_prompts, tail_lines,
 					)
 				if progress is not None:
@@ -542,7 +452,7 @@ class LocalTranslationEngine:
 		return outcome
 
 	def _numbered_chunk(
-		self, indices, texts, results, glossary, system_prompt, build_user_prompt,
+		self, indices, texts, results, system_prompt, build_user_prompt,
 		parse_numbered, context_prompts, tail_lines,
 	) -> None:
 		batch = [texts[index] for index in indices]
@@ -563,25 +473,25 @@ class LocalTranslationEngine:
 			if len(indices) > 1:
 				middle = len(indices) // 2
 				for part in (indices[:middle], indices[middle:]):
-					self._numbered_chunk(part, texts, results, glossary, system_prompt, build_user_prompt, parse_numbered, context_prompts, tail_lines)
+					self._numbered_chunk(part, texts, results, system_prompt, build_user_prompt, parse_numbered, context_prompts, tail_lines)
 				return
 			parsed = [""]
 		missing = []
 		for index, text in zip(indices, parsed):
-			if translation_problem(text, texts[index], glossary) is None:
+			if translation_problem(text, texts[index]) is None:
 				results[index] = text
 			else:
 				missing.append(index)
 		if not missing:
 			return
 		if len(indices) == 1:
-			results[indices[0]] = self._line_with_context(indices[0], texts, glossary, context_prompts)
+			results[indices[0]] = self._line_with_context(indices[0], texts, context_prompts)
 		elif len(missing) < len(indices):
-			self._numbered_chunk(missing, texts, results, glossary, system_prompt, build_user_prompt, parse_numbered, context_prompts, tail_lines)
+			self._numbered_chunk(missing, texts, results, system_prompt, build_user_prompt, parse_numbered, context_prompts, tail_lines)
 		else:
 			middle = len(indices) // 2
 			for part in (indices[:middle], indices[middle:]):
-				self._numbered_chunk(part, texts, results, glossary, system_prompt, build_user_prompt, parse_numbered, context_prompts, tail_lines)
+				self._numbered_chunk(part, texts, results, system_prompt, build_user_prompt, parse_numbered, context_prompts, tail_lines)
 
 	# ---------- bilingual reconstruction (after playback) ----------
 
@@ -589,7 +499,6 @@ class LocalTranslationEngine:
 		self,
 		ja_lines: list[str],
 		*,
-		glossary: dict | None,
 		system_prompt: str,
 		build_user_prompt,
 		context_prompts,
@@ -604,9 +513,9 @@ class LocalTranslationEngine:
 			for batch_no, start in enumerate(range(0, len(ja_lines), self.batch_lines), start=1):
 				indices = list(range(start, min(start + self.batch_lines, len(ja_lines))))
 				if self.is_translation_only:
-					pairs = [(ja_lines[index], self._plain_line(ja_lines[index], glossary) or TRANSLATION_FAILED_TEXT) for index in indices]
+					pairs = [(ja_lines[index], self._plain_line(ja_lines[index]) or TRANSLATION_FAILED_TEXT) for index in indices]
 				else:
-					pairs = self._bilingual_chunk(indices, ja_lines, glossary, system_prompt, build_user_prompt, context_prompts, tail_lines)
+					pairs = self._bilingual_chunk(indices, ja_lines, system_prompt, build_user_prompt, context_prompts, tail_lines)
 				parts.append("\n\n".join(f"{ja}\n{zh}" for ja, zh in pairs))
 				if progress is not None:
 					progress(batch_no, total)
@@ -615,7 +524,7 @@ class LocalTranslationEngine:
 			return None
 		return parts
 
-	def _bilingual_chunk(self, indices, lines, glossary, system_prompt, build_user_prompt, context_prompts, tail_lines):
+	def _bilingual_chunk(self, indices, lines, system_prompt, build_user_prompt, context_prompts, tail_lines):
 		batch = [lines[index] for index in indices]
 		context_tail = "\n".join(lines[max(0, indices[0] - tail_lines):indices[0]])
 		pairs = None
@@ -625,7 +534,7 @@ class LocalTranslationEngine:
 				max_tokens=self._budget(batch, 3.0), splittable=len(indices) > 1,
 			)
 			candidate = parse_bilingual_pairs(reply)
-			if bilingual_pairs_acceptable(candidate, batch, glossary):
+			if bilingual_pairs_acceptable(candidate, batch):
 				pairs = candidate
 		except LocalServiceUnavailable:
 			raise
@@ -638,8 +547,8 @@ class LocalTranslationEngine:
 		if len(indices) > 1:
 			middle = len(indices) // 2
 			return (
-				self._bilingual_chunk(indices[:middle], lines, glossary, system_prompt, build_user_prompt, context_prompts, tail_lines)
-				+ self._bilingual_chunk(indices[middle:], lines, glossary, system_prompt, build_user_prompt, context_prompts, tail_lines)
+				self._bilingual_chunk(indices[:middle], lines, system_prompt, build_user_prompt, context_prompts, tail_lines)
+				+ self._bilingual_chunk(indices[middle:], lines, system_prompt, build_user_prompt, context_prompts, tail_lines)
 			)
-		zh = self._line_with_context(indices[0], lines, glossary, context_prompts)
+		zh = self._line_with_context(indices[0], lines, context_prompts)
 		return [(batch[0], zh or TRANSLATION_FAILED_TEXT)]

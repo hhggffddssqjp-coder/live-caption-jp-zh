@@ -129,7 +129,7 @@ cd C:\llm\llama.cpp
 python compare_translation_backends.py transcripts/transcript_XXXXXXXX_XXXXXX.txt --judge --limit 60
 ```
 
-- 會產生 `..._backend_report.md`：兩個引擎的問題率、術語命中率、延遲、逐句並排
+- 會產生 `..._backend_report.md`：兩個引擎的問題率、延遲、逐句並排
 - `--judge` 請 Gemini 盲評（A/B 隨機），會用到 Gemini 額度（60 句約 120 次呼叫，預設每次間隔 4.5 秒）
 - 終端機最後印 **PASS** 才代表本機不低於 Gemini；FAIL 的話換更大的模型再測，或繼續用 Gemini（本來就是預設）
 
@@ -163,4 +163,3 @@ python compare_translation_backends.py transcripts/transcript_XXXXXXXX_XXXXXX.tx
 
 - 本機模式的實際翻譯品質取決於載入的模型；「不低於 Gemini」要以 C 的報告為準。
 - Riva-Translate 這類翻譯專用模型會被自動偵測成 `riva` 模式：逐句翻譯、不看上下文、不校正潤稿，品質可能低於 Gemini（啟動時與整理稿檔頭都會註明）。
-- `glossary.json` 右邊的對應值（例如 ゆみやひな → 羊宮妃那）在 Gemini 與本機通用模型的提示詞裡沒有被使用（master 原本就是如此，這個 PR 沒有改動 Gemini 提示詞）；只有 `riva` 模式會真的換成右邊的文字。
