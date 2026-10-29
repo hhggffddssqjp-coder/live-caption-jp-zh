@@ -117,7 +117,7 @@ from PIL import Image, ImageTk
 
 from faster_whisper import WhisperModel
 from silero_vad import load_silero_vad, VADIterator
-from audio_timing import AudioRingBuffer, PlaybackDriftTracker  # 時間對齊的純邏輯，可以單獨測試
+from audio_timing import AudioRingBuffer, EnergySpeechGate, PlaybackDriftTracker  # 純邏輯，可以單獨測試
 from local_translation import (
     TRANSLATION_FAILED_TEXT, LocalTranslationEngine, bilingual_pairs_acceptable, parse_bilingual_pairs,
     translation_problem,
@@ -213,6 +213,18 @@ TARGET_SR = 16000                 # Whisper / VAD / 延遲音訊緩衝區使用�
 VAD_CHUNK_SAMPLES = 512           # Silero VAD 在 16kHz 下要求的固定窗格大小 (32ms)
 VAD_THRESHOLD = 0.5               # 0~1，語音機率超過這個值才算「有人在講話」
 VAD_SPEECH_PAD_MS = 100           # 語句前後多保留一點音訊，避免咬字被切掉
+
+# 氣音模式（ASMR）：Silero VAD 認不出氣音（實測一段 355 秒的 ASMR 錄音只有 0.2% 的時間
+# 被當成人聲），改用音量判斷有沒有人在講話（見 audio_timing.EnergySpeechGate）。
+# 設環境變數 CAPTION_VAD=asmr 開啟；ASMR_RMS_THRESHOLD 是音量門檻（16 位元單位，
+# 60 大約是 -55 dBFS）。任何夠大的聲音都會被當成講話，所以只適合安靜的內容。
+ASMR_MODE = os.environ.get("CAPTION_VAD", "").strip().lower() in ("asmr", "energy")
+ASMR_RMS_THRESHOLD = _env_seconds("ASMR_RMS_THRESHOLD", 60.0)  # 讀正數的工具函式，單位不是秒
+
+# 只攔下「幾乎整段都沒辨識到」的整理稿，避免一般直播的音樂、聊天空檔也觸發。
+# 至少錄滿兩分鐘，且辨識出的語音不到整段的 10%，才保留錄音供重新處理。
+REBUILD_SPARSE_MIN_RECORDING_SEC = 120.0
+REBUILD_SPARSE_SPEECH_RATIO = 0.10
 
 # 這兩個值故意拉長：日文常有動詞放句尾、句中助詞換氣停頓的狀況，
 # 停頓門檻太短會把一句話切成兩半，導致辨識/翻譯失去前後文法脈絡。
@@ -617,6 +629,16 @@ def _rebuild_is_complete(missing: int, placeholders: int, problems: int, total: 
     return placeholders == 0 and missing <= allowance and problems <= allowance
 
 
+def _rebuild_speech_too_sparse(speech_sec: float, recording_sec: float | None) -> bool:
+    """長錄音只辨識到極少語音時保留原檔；不知道錄音長度就不做這項檢查。"""
+    return (
+        recording_sec is not None
+        and math.isfinite(recording_sec)
+        and recording_sec >= REBUILD_SPARSE_MIN_RECORDING_SEC
+        and speech_sec < recording_sec * REBUILD_SPARSE_SPEECH_RATIO
+    )
+
+
 def rebuild_transcript_from_full_audio(
     wav_path: "Path",
     asr_model: "WhisperModel",
@@ -639,22 +661,35 @@ def rebuild_transcript_from_full_audio(
     segments, _ = asr_model.transcribe(
         str(wav_path),
         language="ja",
-        vad_filter=True,   # 交給 Whisper 內建 VAD 處理整段音訊的斷句，不用自己切
+        # 交給 Whisper 內建 VAD（底層也是 Silero）處理整段音訊的斷句；氣音模式不用，
+        # 不然氣音一樣會被當成沒人講話，整理稿幾乎是空的
+        vad_filter=not ASMR_MODE,
         beam_size=WHISPER_BEAM_SIZE,
         no_speech_threshold=0.6,
         log_prob_threshold=-1.0,
     )
 
     ja_lines = []
+    speech_sec = 0.0
     for seg in segments:
         text = seg.text.strip()
         if not text or text in _HALLUCINATION_DENYLIST:
             continue
         ja_lines.append(text)
+        speech_sec += seg.end - seg.start
 
     if not ja_lines:
         print("完整錄音重新辨識沒有偵測到內容，略過這份整理稿。")
         return None
+
+    recording_sec = None
+    try:
+        with wave.open(str(wav_path), "rb") as recording:
+            recording_sec = recording.getnframes() / recording.getframerate()
+    except (OSError, EOFError, wave.Error):
+        # 長度讀不到就略過這項檢查，仍照原本的句數與翻譯品質判斷。
+        pass
+    sparse_speech = _rebuild_speech_too_sparse(speech_sec, recording_sec)
 
     print(f"重新辨識完成，共 {len(ja_lines)} 句，正在請翻譯模型分批整理成完整逐字稿...")
 
@@ -692,7 +727,7 @@ def rebuild_transcript_from_full_audio(
             "準確度會比即時觀看時看到的字幕更好，內容照實呈現、沒有自己刪減。"
         )
     missing, placeholders, problems = _rebuild_coverage(polished_parts, ja_lines, glossary)
-    complete = _rebuild_is_complete(missing, placeholders, problems, len(ja_lines))
+    complete = _rebuild_is_complete(missing, placeholders, problems, len(ja_lines)) and not sparse_speech
     keep_recording = bool(failed_batches) or not complete
     if keep_recording:
         reasons = []
@@ -704,6 +739,11 @@ def rebuild_transcript_from_full_audio(
             reasons.append(f"{placeholders} 句翻譯失敗")
         if problems:
             reasons.append(f"{problems} 句翻譯可能有問題")
+        if sparse_speech:
+            reasons.append(
+                f"辨識出的語音只有 {speech_sec / 60:.1f} 分鐘，錄音有 {recording_sec / 60:.1f} 分鐘，"
+                "可能有很小聲或氣音的段落沒聽到；可以用氣音模式重新處理"
+            )
         # 整理稿是拿來讀、分享的，不放絕對路徑（裡面有 Windows 使用者資料夾名稱）
         summary += (
             f"\n\n⚠️ 這份整理稿可能有缺漏（{'、'.join(reasons)}，共 {len(ja_lines)} 句）；"
@@ -726,8 +766,7 @@ def rebuild_transcript_from_full_audio(
     # 用完就刪掉，不用留著佔硬碟空間——但只要整理稿可能有缺漏，就保留錄音，
     # 不然缺漏的內容就永遠找不回來了
     if keep_recording:
-        print(f"整理稿可能有缺漏（失敗批數 {failed_batches}、少 {missing} 句、翻譯失敗 {placeholders} 句、"
-              f"可能有問題 {problems} 句，共 {len(ja_lines)} 句），已保留完整錄音：{wav_path}")
+        print(f"整理稿可能有缺漏（{'、'.join(reasons)}，共 {len(ja_lines)} 句），已保留完整錄音：{wav_path}")
         print(f"之後可以用這行指令重新處理：{_rebuild_command(wav_path)}")
         return out_path
     try:
@@ -1372,15 +1411,21 @@ class AudioCapture(threading.Thread):
         self._recording = False  # 「停止錄製」只是暫停寫入，檔案留著開，下次開始接著寫
         self._wav_lock = threading.Lock()
 
-        print("載入語音活動偵測模型（Silero VAD，第一次執行會自動下載）...")
-        self.vad_model = load_silero_vad()
-        self.vad_iterator = VADIterator(
-            self.vad_model,
-            sampling_rate=TARGET_SR,
-            threshold=VAD_THRESHOLD,
-            min_silence_duration_ms=SILENCE_END_MS,
-            speech_pad_ms=VAD_SPEECH_PAD_MS,
-        )
+        if ASMR_MODE:
+            # 氣音模式：用音量判斷（介面跟 VADIterator 一樣，下面的迴圈不用改）
+            print(f"氣音模式（ASMR）：用音量判斷有沒有人在講話，門檻 RMS {ASMR_RMS_THRESHOLD:g}。")
+            self.vad_model = None
+            self.vad_iterator = EnergySpeechGate(ASMR_RMS_THRESHOLD, SILENCE_END_MS, sample_rate=TARGET_SR)
+        else:
+            print("載入語音活動偵測模型（Silero VAD，第一次執行會自動下載）...")
+            self.vad_model = load_silero_vad()
+            self.vad_iterator = VADIterator(
+                self.vad_model,
+                sampling_rate=TARGET_SR,
+                threshold=VAD_THRESHOLD,
+                min_silence_duration_ms=SILENCE_END_MS,
+                speech_pad_ms=VAD_SPEECH_PAD_MS,
+            )
         self._stop_event = threading.Event()
 
     def start_recording(self) -> bool:

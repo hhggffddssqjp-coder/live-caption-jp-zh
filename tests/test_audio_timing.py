@@ -8,7 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import numpy as np  # noqa: E402
 
-from audio_timing import AudioRingBuffer, PlaybackDriftTracker  # noqa: E402
+from audio_timing import AudioRingBuffer, EnergySpeechGate, PlaybackDriftTracker  # noqa: E402
 
 SR = 1000          # small sample rate keeps the numbers readable
 BLOCK = 32         # 32 ms blocks, like the real capture loop
@@ -140,6 +140,57 @@ class PlaybackDriftTrackerTests(unittest.TestCase):
 		tracker.correction(95.0, 100.0, 5.0)
 		tracker.reset()
 		self.assertEqual(tracker.correction(150.0, 105.0, 5.0), 0.0)
+
+
+class EnergySpeechGateTests(unittest.TestCase):
+	SR = 16000
+	CHUNK = 512  # 32 ms, the same window size the capture loop feeds
+
+	def chunk_at_rms(self, rms_int16):
+		# a constant signal has an RMS equal to its amplitude
+		return np.full(self.CHUNK, rms_int16 / 32768.0, dtype=np.float32)
+
+	def feed(self, gate, pattern):
+		"""pattern: list of (rms, chunks); returns every non-None event with its chunk index."""
+		events, index = [], 0
+		for rms, count in pattern:
+			for _ in range(count):
+				event = gate(self.chunk_at_rms(rms))
+				if event is not None:
+					events.append((index, event))
+				index += 1
+		return events
+
+	def test_rms_is_measured_in_16_bit_units(self):
+		self.assertAlmostEqual(EnergySpeechGate.rms_int16(self.chunk_at_rms(60)), 60, places=2)
+
+	def test_quiet_whisper_above_the_threshold_starts_and_silence_ends_a_sentence(self):
+		gate = EnergySpeechGate(rms_threshold=60, silence_end_ms=700, sample_rate=self.SR)
+		# 0.3 s of near silence, 2 s of whisper at RMS 120, then 1 s of near silence
+		events = self.feed(gate, [(10, 10), (120, 62), (10, 31)])
+		self.assertEqual(events[0], (10, {"start": 10 * self.CHUNK}))
+		# 700 ms of silence = 22 chunks of 32 ms; the end lands on the 22nd quiet chunk
+		self.assertEqual(len(events), 2)
+		end_index, end_event = events[1]
+		self.assertIn("end", end_event)
+		self.assertEqual(end_index, 10 + 62 + 21)
+
+	def test_short_pauses_inside_a_whisper_do_not_split_the_sentence(self):
+		gate = EnergySpeechGate(rms_threshold=60, silence_end_ms=700, sample_rate=self.SR)
+		events = self.feed(gate, [(120, 20), (10, 10), (120, 20), (10, 25)])  # 320 ms dip in the middle
+		self.assertEqual([list(e)[0] for _, e in events], ["start", "end"])
+
+	def test_below_the_threshold_is_never_speech(self):
+		gate = EnergySpeechGate(rms_threshold=60, silence_end_ms=700, sample_rate=self.SR)
+		self.assertEqual(self.feed(gate, [(55, 100)]), [])
+
+	def test_return_seconds_and_reset(self):
+		gate = EnergySpeechGate(rms_threshold=60, silence_end_ms=700, sample_rate=self.SR)
+		self.feed(gate, [(10, 5)])
+		event = gate(self.chunk_at_rms(200), return_seconds=True)
+		self.assertAlmostEqual(event["start"], 5 * self.CHUNK / self.SR)
+		gate.reset_states()
+		self.assertEqual(gate(self.chunk_at_rms(200)), {"start": 0})
 
 
 if __name__ == "__main__":
