@@ -27,16 +27,17 @@
 
 ## 快速開始
 
-需要：Windows 10/11、NVIDIA 顯示卡（建議 8 GB 以上顯存）、Python 3.10 以上。
+需要：Windows 10/11（64 位元）、Python 3.10 以上（64 位元）。建議使用 NVIDIA 顯示卡、8 GB 以上顯存；沒有也能用 CPU，但語音辨識會非常慢。
 
-1. **安裝 CUDA 版 PyTorch**，再裝其他套件（詳見下方「安裝」第 1、2 步）
+1. **下載並解壓縮程式**：在 GitHub 頁面按綠色 **Code → Download ZIP**，下載後先解壓縮，進入有 `install.bat` 的資料夾。可以放在沒有空白的路徑，例如 `C:\live-caption-jp-zh`。會用 Git 的人也可以執行：
    ```bash
-   pip install -r requirements.txt
+   git clone https://github.com/hhggffddssqjp-coder/live-caption-jp-zh.git
+   cd live-caption-jp-zh
    ```
-2. **準備 Gemini API 金鑰**：到 https://aistudio.google.com/apikey 申請，把金鑰貼進程式資料夾的 `gemini_api_key.txt`
-3. **安裝虛擬音訊線和 SoundVolumeView**（見「安裝」第 4 步）。不裝的話會錄到電腦上所有聲音；
-   而且延遲聲音要播到**另一個**裝置（例如耳機），不然會被再錄回去，形成回音迴圈（設定畫面會提醒）
-4. **執行**
+2. **雙擊 `install.bat`**，依畫面指示安裝套件、準備音訊工具與 Gemini 金鑰。沒有 Python 時會開啟下載頁；安裝 Python 時記得勾選 **Add python.exe to PATH**，再雙擊一次 `install.bat`。
+   安裝可能需要幾分鐘，可以重跑，已經裝好的項目會略過。VB-Cable 驅動需要自己以系統管理員身分安裝，**裝完要重開機**；只用本機模型可以略過 Gemini 金鑰。
+3. **有問題就自我檢查**：在程式資料夾上方的網址列輸入 `cmd` 按 Enter，會開出一個已經在這個資料夾的終端機，在裡面執行 `python check_setup.py`，它會逐項說明缺什麼、怎麼補。把最後「可以整段複製貼給 AI 助手」的摘要整段貼給 ChatGPT 或 Gemini 求助即可；摘要不含金鑰或使用者資料夾的完整路徑，**不要另外貼出金鑰檔內容**。
+4. **檢查沒有 ❌ 後啟動**：在程式資料夾的終端機執行：
    ```bash
    python live_caption_gemini.py
    ```
@@ -110,10 +111,12 @@ python live_caption_gemini.py --rebuild "transcripts\transcript_20261023_010203_
 
 ## 安裝
 
+`install.bat` 會自動做這些；想手動安裝或自動安裝失敗時看這裡。VB-Cable 驅動仍需依指示自行安裝。
+
 ### 1. 安裝 CUDA 版 PyTorch（不做這步會退回 CPU，會非常慢）
 
 到 https://pytorch.org/get-started/locally/ 選 Stable / Windows / Pip / Python，Compute Platform 選你的驅動程式支援的 CUDA 版本（用 `nvidia-smi` 查）。
-RTX 50 系列（Blackwell）需要 **CUDA 12.9 以上**，例如：
+RTX 50 系列（Blackwell）需要 **CUDA 12.8 以上**，例如：
 
 ```bash
 pip install torch --index-url https://download.pytorch.org/whl/cu130
@@ -250,6 +253,7 @@ llama-server -m 你的模型.gguf --host 127.0.0.1 --port 8766 -c 8192 -np 1 -ng
 
 ## 常見問題
 
+- **不知道哪裡沒裝好**：在程式資料夾的終端機執行 `python check_setup.py`，照每項的「怎麼補」處理；也可以把最後的摘要整段貼給 AI 助手求助。不要貼出 API 金鑰。
 - **用 CABLE 擷取但字幕都不出來（全程靜音）**：切換瀏覽器的輸出裝置後，只有「新開始播放」的聲音會改走 CABLE。
   到瀏覽器重新整理影片頁面（或暫停再播放）就好。還是不行的話，確認 `tools\SoundVolumeView.exe` 存在，
   或到 Windows 音量混音器手動把瀏覽器輸出設成 `CABLE Input`
@@ -307,6 +311,9 @@ python compare_translation_backends.py 樣本.txt --backends local     # 只測�
 
 | 檔案 | 用途 |
 | --- | --- |
+| `install.bat` | 雙擊開始安裝，自動尋找 Python，結束後保留畫面讓你看結果 |
+| `install.py` | 安裝套件與音訊工具、引導設定金鑰；可重跑，已完成的項目會略過 |
+| `check_setup.py` | 逐項檢查安裝狀況，附上補救方法和可貼給 AI 助手的摘要 |
 | `live_caption_gemini.py` | 主程式（檔名保留 gemini 是為了相容舊的捷徑，其實兩種翻譯引擎都在這裡） |
 | `screen_capture_worker.py` | 在獨立行程裡擷取畫面，透過共享記憶體傳回主程式 |
 | `audio_timing.py` | 延遲播放的聲音緩衝區（立體聲、對齊牆上時鐘）和播放端的漂移校正 |
