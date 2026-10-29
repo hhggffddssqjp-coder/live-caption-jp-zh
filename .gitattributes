@@ -1,0 +1,2 @@
+# cmd needs CRLF in .bat files; -text keeps them byte-for-byte so "Download ZIP" gets CRLF too
+*.bat -text
