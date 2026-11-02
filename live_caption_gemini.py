@@ -117,6 +117,7 @@ from PIL import Image, ImageTk
 from faster_whisper import WhisperModel
 from silero_vad import load_silero_vad, VADIterator
 from audio_timing import AudioRingBuffer, EnergySpeechGate, PlaybackDriftTracker  # 純邏輯，可以單獨測試
+from frame_buffer import FrameBuffer
 from local_translation import (
     TRANSLATION_FAILED_TEXT, LocalTranslationEngine, bilingual_pairs_acceptable, parse_bilingual_pairs,
     translation_problem,
@@ -257,8 +258,11 @@ CAPTURE_TARGET_FPS = 60
 # 這是數位訊號直接縮放，不是類比訊號，調再低也不會有雜訊，可以放心壓低。
 VOLUME_DUCK_LEVEL = 0.05
 
-# 畫面/聲音緩衝區最多留幾秒（要比 DISPLAY_DELAY_SEC 大，多留一點緩衝空間）
+# 聲音緩衝需要額外餘裕，避免擷取與播放排程的短暫落差。
 BUFFER_MARGIN_SEC = 8.0
+# 畫面只查詢「現在減掉延遲」附近的一張，額外 1 秒就足以涵蓋排程落差，
+# 不需要跟聲音一樣多留 8 秒的原始影格。
+FRAME_BUFFER_MARGIN_SEC = 1.0
 
 TRANSCRIPT_DIR = Path(__file__).parent / "transcripts"
 TRANSCRIPT_DIR.mkdir(exist_ok=True)
@@ -939,34 +943,6 @@ class PauseState:
         return True
 
 
-class FrameBuffer:
-    """執行緒安全的畫面緩衝區：擷取執行緒寫入畫面，播放視窗讀取「N 秒前」的那一張"""
-
-    def __init__(self, max_seconds: float):
-        self.max_seconds = max_seconds
-        self.lock = threading.Lock()
-        self.frames = deque()  # [(timestamp, PIL.Image)]，依時間先後排列
-
-    def push(self, ts: float, image):
-        with self.lock:
-            self.frames.append((ts, image))
-            cutoff = ts - self.max_seconds
-            while self.frames and self.frames[0][0] < cutoff:
-                self.frames.popleft()
-
-    def get_at(self, target_ts: float):
-        with self.lock:
-            if not self.frames:
-                return None
-            best = self.frames[0][1]
-            for ts, image in self.frames:
-                if ts <= target_ts:
-                    best = image
-                else:
-                    break
-            return best
-
-
 class ScreenCapture:
     """擷取指定視窗的畫面，存進 FrameBuffer 供延遲播放。
 
@@ -981,8 +957,8 @@ class ScreenCapture:
     pickle 序列化、複製進系統管道，1920 寬、60fps 的資料量（一秒幾百 MB）
     撐不住，會掉幀、卡頓；共享記憶體是直接讀寫同一塊記憶體，沒有序列化/複製
     的成本。用 3 個輪替緩衝格（見 screen_capture_worker.NUM_SLOTS），寫入端
-    寫完整格才更新「最新是哪一格」的索引，讀取端只讀完整寫完的那一格，繞一圈
-    回來蓋掉同一格之前，讀取端早就複製走了，不用額外加鎖。
+    以每格 uint64 序號標記寫入中/已完成；讀取端複製前後核對序號，避免主行程
+    暫時忙碌、寫入端繞圈覆寫時讀到不完整畫面，並以 frame id 判斷是否有新影格。
 
     對外行為跟原本的執行緒版本完全一樣：start()/stop()/switch_window()，
     呼叫端不用改。
@@ -1006,6 +982,8 @@ class ScreenCapture:
         # HWND 用 signed 64-bit 存，Windows 上視窗代碼本質是指標大小的值，
         # 用 32-bit 存在少數情況下可能裝不下
         self._hwnd_shared = multiprocessing.Value(ctypes.c_longlong, hwnd)
+        # Tk 穩定後才發布畫布的可用寬高；0 表示初始尚未限制尺寸。
+        self.target_size = multiprocessing.Array('i', [0, 0])
 
         # 每一格的容量保守抓「寬 x 寬」的正方形上限（一般影片視窗高度不會超過
         # 寬度），RGB 3 bytes/像素；真的遇到更高的畫面，擷取行程那邊會跳過
@@ -1017,6 +995,7 @@ class ScreenCapture:
         )
         # 每格存 (height, width, timestamp) 三個值
         self._meta = multiprocessing.Array(ctypes.c_double, self.NUM_SLOTS * 3)
+        self._sequences = multiprocessing.Array(ctypes.c_uint64, self.NUM_SLOTS)
         self._latest_slot = multiprocessing.Value(ctypes.c_int, -1)  # -1 = 還沒有任何畫面
 
         self._stop_event = multiprocessing.Event()
@@ -1034,6 +1013,7 @@ class ScreenCapture:
                 self._hwnd_shared, self.max_width, self.target_fps,
                 self._shm.name, self._slot_nbytes, self._meta,
                 self._latest_slot, self._stop_event, self._pause_event,
+                self.target_size, self._sequences,
             ),
             daemon=True,
         )
@@ -1046,7 +1026,9 @@ class ScreenCapture:
         self._receiver_thread.start()
 
     def _receive_loop(self):
-        last_seen = -1
+        from screen_capture_worker import read_latest_frame
+
+        last_seen = 0
         while not self._receiver_stop.is_set():
             # 把主行程這邊的暫停旗標同步給擷取行程，按暫停時畫面擷取才會一起停
             if self.pause_state is not None:
@@ -1055,18 +1037,13 @@ class ScreenCapture:
                 else:
                     self._pause_event.clear()
 
-            slot = self._latest_slot.value
-            if slot == -1 or slot == last_seen:
+            snapshot = read_latest_frame(
+                self._shm_view, self._meta, self._sequences, self._latest_slot, last_seen,
+            )
+            if snapshot is None:
                 time.sleep(0.005)
                 continue
-            last_seen = slot
-
-            idx = slot * 3
-            h = int(self._meta[idx])
-            w = int(self._meta[idx + 1])
-            ts = self._meta[idx + 2]
-            nbytes = h * w * 3
-            frame = self._shm_view[slot, :nbytes].reshape(h, w, 3).copy()
+            last_seen, ts, frame = snapshot
             self.frame_buffer.push(ts, frame)
 
     def switch_window(self, hwnd: int):
@@ -2017,6 +1994,12 @@ class PlayerWindow:
         self.container.configure(bg="black")
         self.canvas = tk.Canvas(self.container, bg="black", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
+        from frame_pipeline import DebouncedSize
+
+        self._capture_size = DebouncedSize(
+            self.root.after, self.root.after_cancel, self._publish_capture_size,
+        )
+        self.canvas.bind("<Configure>", self._on_canvas_resize)
 
         # 字幕區固定高度、關掉 pack_propagate：字幕內容一多一少，高度都不會變，
         # 不會因為文字長度不同就把上面的畫面區域推來推去。字太多就在固定範圍裡
@@ -2049,6 +2032,16 @@ class PlayerWindow:
             wrap = max(200, event.width - 40)
             self.ja_label.config(wraplength=wrap)
             self.zh_label.config(wraplength=wrap)
+
+    def _on_canvas_resize(self, event):
+        if event.widget is self.canvas:
+            self._capture_size.update(event.width, event.height)
+
+    def _publish_capture_size(self, width, height):
+        if self.screen_capture is not None:
+            target = self.screen_capture.target_size
+            with target.get_lock():
+                target[:] = (width, height)
 
     def _on_toggle_pause(self):
         if self.pause_state is None:
@@ -2122,8 +2115,12 @@ class PlayerWindow:
             new_w, new_h = max(1, int(fw * scale)), max(1, int(fh * scale))
             size_changed = (new_w, new_h) != self._photo_size
             if frame is not self._last_frame or size_changed:
-                # 用 cv2 縮放，比 PIL 的 resize 快很多，減少畫面更新這一步造成的掉幀
-                resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+                # 擷取端已先縮到播放區域；尺寸吻合就省掉 Tk 主執行緒的縮放。
+                # 放大視窗後，延遲緩衝內約 15 秒的舊小圖仍會放大顯示，短暫稍糊，
+                # 換取保存期間較低的記憶體與複製成本。
+                resized = frame if (fw, fh) == (new_w, new_h) else cv2.resize(
+                    frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR,
+                )
                 if size_changed or self._image_item is None:
                     # 視窗大小變了才重建圖片；平常每一格都只 paste 進同一張圖，
                     # 省掉每格「新建 PhotoImage + 刪掉重畫畫布」的成本（實測約快一倍）
@@ -2385,7 +2382,7 @@ def main():
     # 最後才去切換瀏覽器的音訊輸出：以前是先切換再載入 Whisper，載入失敗或按 Ctrl+C
     # 就不會走到 finally，瀏覽器會一直停在 CABLE
     buffer_seconds = DISPLAY_DELAY_SEC + BUFFER_MARGIN_SEC
-    frame_buffer = FrameBuffer(max_seconds=buffer_seconds)
+    frame_buffer = FrameBuffer(max_seconds=DISPLAY_DELAY_SEC + FRAME_BUFFER_MARGIN_SEC)
     # 用擷取裝置的原始取樣率存延遲緩衝，不要用 TARGET_SR（那是 16kHz，給 Whisper
     # 用的降頻版本）——不然延遲播放出來的聲音品質會被拖到跟語音辨識輸入一樣低
     native_sr = int(input_device["defaultSampleRate"])
