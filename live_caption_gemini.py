@@ -257,8 +257,11 @@ CAPTURE_TARGET_FPS = 60
 # 這是數位訊號直接縮放，不是類比訊號，調再低也不會有雜訊，可以放心壓低。
 VOLUME_DUCK_LEVEL = 0.05
 
-# 畫面/聲音緩衝區最多留幾秒（要比 DISPLAY_DELAY_SEC 大，多留一點緩衝空間）
+# 聲音緩衝需要額外餘裕，避免擷取與播放排程的短暫落差。
 BUFFER_MARGIN_SEC = 8.0
+# 畫面只查詢「現在減掉延遲」附近的一張，額外 1 秒就足以涵蓋排程落差，
+# 不需要跟聲音一樣多留 8 秒的原始影格。
+FRAME_BUFFER_MARGIN_SEC = 1.0
 
 TRANSCRIPT_DIR = Path(__file__).parent / "transcripts"
 TRANSCRIPT_DIR.mkdir(exist_ok=True)
@@ -2385,7 +2388,7 @@ def main():
     # 最後才去切換瀏覽器的音訊輸出：以前是先切換再載入 Whisper，載入失敗或按 Ctrl+C
     # 就不會走到 finally，瀏覽器會一直停在 CABLE
     buffer_seconds = DISPLAY_DELAY_SEC + BUFFER_MARGIN_SEC
-    frame_buffer = FrameBuffer(max_seconds=buffer_seconds)
+    frame_buffer = FrameBuffer(max_seconds=DISPLAY_DELAY_SEC + FRAME_BUFFER_MARGIN_SEC)
     # 用擷取裝置的原始取樣率存延遲緩衝，不要用 TARGET_SR（那是 16kHz，給 Whisper
     # 用的降頻版本）——不然延遲播放出來的聲音品質會被拖到跟語音辨識輸入一樣低
     native_sr = int(input_device["defaultSampleRate"])
