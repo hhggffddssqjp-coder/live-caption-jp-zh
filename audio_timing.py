@@ -85,7 +85,11 @@ class AudioRingBuffer:
                 drift = min(self._recent_drift)
                 if drift > self.DRIFT_THRESHOLD_SEC:
                     # 少了一段樣本：補等長的靜音，讓後面的聲音回到正確的時間點
-                    self._store(np.zeros((int(drift * self.sample_rate), self.channels), dtype=np.float32))
+                    gap_samples = int(drift * self.sample_rate)
+                    silence_samples = min(gap_samples, self.max_samples)
+                    # 缺口前段會被環形緩衝區覆蓋，只推進絕對位置，不配置那段靜音。
+                    self.total_written += gap_samples - silence_samples
+                    self._store(np.zeros((silence_samples, self.channels), dtype=np.float32))
                     self._recent_drift.clear()
                 elif captured_end - expected_end < -self.DRIFT_THRESHOLD_SEC:
                     # 樣本比牆上時鐘多（擷取裝置時鐘偏快）：丟掉這批開頭多出來的部分

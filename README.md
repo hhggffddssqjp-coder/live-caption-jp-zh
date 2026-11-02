@@ -248,7 +248,7 @@ llama-server -m 你的模型.gguf --host 127.0.0.1 --port 8766 -c 8192 -np 1 -ng
 - **怎麼判斷「沒人說話」**：只用 Whisper 原生的規則（沒人說話的機率 > 0.6 **而且**辨識信心 < -1.0 才丟掉）。
   `large-v3` 遇到背景音樂時，常把清楚的人聲也判斷成「很可能沒人說話」，以前多加一道
   「機率 > 0.6 就整句丟掉」的檢查，實測 74 句裡誤丟了 13 句，已經拿掉了
-- **一句話常被切成兩半**：把 `live_caption_gemini.py` 裡的 `SILENCE_END_MS`（目前 700）調大；
+- **一句話常被切成兩半**：把 `caption_app.py` 裡的 `SILENCE_END_MS`（目前 700）調大；
   想要字幕更快出現就調小
 
 ## 常見問題
@@ -314,7 +314,8 @@ python compare_translation_backends.py 樣本.txt --backends local     # 只測�
 | `install.bat` | 雙擊開始安裝，自動尋找 Python，結束後保留畫面讓你看結果 |
 | `install.py` | 安裝套件與音訊工具、引導設定金鑰；可重跑，已完成的項目會略過 |
 | `check_setup.py` | 逐項檢查安裝狀況，附上補救方法和可貼給 AI 助手的摘要 |
-| `live_caption_gemini.py` | 主程式（檔名保留 gemini 是為了相容舊的捷徑，其實兩種翻譯引擎都在這裡） |
+| `live_caption_gemini.py` | 輕量啟動入口（相容原本的指令、捷徑與 import；擷取子行程不載入主程式） |
+| `caption_app.py` | 字幕主程式，包含兩種翻譯引擎、音訊擷取與介面 |
 | `screen_capture_worker.py` | 在獨立行程裡擷取畫面，透過共享記憶體傳回主程式 |
 | `audio_timing.py` | 延遲播放的聲音緩衝區（立體聲、對齊牆上時鐘）和播放端的漂移校正 |
 | `startup_gui.py` | 「開始擷取前設定」視窗 |
