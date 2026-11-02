@@ -1009,6 +1009,8 @@ class ScreenCapture:
         # HWND 用 signed 64-bit 存，Windows 上視窗代碼本質是指標大小的值，
         # 用 32-bit 存在少數情況下可能裝不下
         self._hwnd_shared = multiprocessing.Value(ctypes.c_longlong, hwnd)
+        # Tk 穩定後才發布畫布的可用寬高；0 表示初始尚未限制尺寸。
+        self.target_size = multiprocessing.Array('i', [0, 0])
 
         # 每一格的容量保守抓「寬 x 寬」的正方形上限（一般影片視窗高度不會超過
         # 寬度），RGB 3 bytes/像素；真的遇到更高的畫面，擷取行程那邊會跳過
@@ -1037,6 +1039,7 @@ class ScreenCapture:
                 self._hwnd_shared, self.max_width, self.target_fps,
                 self._shm.name, self._slot_nbytes, self._meta,
                 self._latest_slot, self._stop_event, self._pause_event,
+                self.target_size,
             ),
             daemon=True,
         )
@@ -2020,6 +2023,12 @@ class PlayerWindow:
         self.container.configure(bg="black")
         self.canvas = tk.Canvas(self.container, bg="black", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
+        from frame_pipeline import DebouncedSize
+
+        self._capture_size = DebouncedSize(
+            self.root.after, self.root.after_cancel, self._publish_capture_size,
+        )
+        self.canvas.bind("<Configure>", self._on_canvas_resize)
 
         # 字幕區固定高度、關掉 pack_propagate：字幕內容一多一少，高度都不會變，
         # 不會因為文字長度不同就把上面的畫面區域推來推去。字太多就在固定範圍裡
@@ -2052,6 +2061,16 @@ class PlayerWindow:
             wrap = max(200, event.width - 40)
             self.ja_label.config(wraplength=wrap)
             self.zh_label.config(wraplength=wrap)
+
+    def _on_canvas_resize(self, event):
+        if event.widget is self.canvas:
+            self._capture_size.update(event.width, event.height)
+
+    def _publish_capture_size(self, width, height):
+        if self.screen_capture is not None:
+            target = self.screen_capture.target_size
+            with target.get_lock():
+                target[:] = (width, height)
 
     def _on_toggle_pause(self):
         if self.pause_state is None:
@@ -2125,8 +2144,12 @@ class PlayerWindow:
             new_w, new_h = max(1, int(fw * scale)), max(1, int(fh * scale))
             size_changed = (new_w, new_h) != self._photo_size
             if frame is not self._last_frame or size_changed:
-                # 用 cv2 縮放，比 PIL 的 resize 快很多，減少畫面更新這一步造成的掉幀
-                resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+                # 擷取端已先縮到播放區域；尺寸吻合就省掉 Tk 主執行緒的縮放。
+                # 放大視窗後，延遲緩衝內約 15 秒的舊小圖仍會放大顯示，短暫稍糊，
+                # 換取保存期間較低的記憶體與複製成本。
+                resized = frame if (fw, fh) == (new_w, new_h) else cv2.resize(
+                    frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR,
+                )
                 if size_changed or self._image_item is None:
                     # 視窗大小變了才重建圖片；平常每一格都只 paste 進同一張圖，
                     # 省掉每格「新建 PhotoImage + 刪掉重畫畫布」的成本（實測約快一倍）

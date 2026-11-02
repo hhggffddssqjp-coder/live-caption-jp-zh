@@ -39,6 +39,8 @@ from multiprocessing import shared_memory
 import cv2
 import numpy as np
 
+from frame_pipeline import fit_frame_size
+
 PW_RENDERFULLCONTENT = 0x00000002
 NUM_SLOTS = 3  # 輪替緩衝格數，3 格給讀寫雙方足夠餘裕，不用額外加鎖
 
@@ -89,21 +91,26 @@ class _SlotWriter:
     """把一張 BGRA 畫面縮放、轉成 RGB，寫進共享記憶體的下一格。
     WGC 的回呼執行緒跟 PrintWindow 迴圈都用這一個，寫入規則只有一份。"""
 
-    def __init__(self, shm_name, slot_nbytes, meta_array, latest_slot, max_width):
+    def __init__(self, shm_name, slot_nbytes, meta_array, latest_slot, max_width, target_size=None):
         self.shm = shared_memory.SharedMemory(name=shm_name)
         self.slots = np.ndarray((NUM_SLOTS, slot_nbytes), dtype=np.uint8, buffer=self.shm.buf)
         self.slot_nbytes = slot_nbytes
         self.meta_array = meta_array
         self.latest_slot = latest_slot
         self.max_width = max_width
+        self.target_size = target_size
         self.write_slot = 0
 
     def write(self, bgra: np.ndarray) -> None:
         h, w = bgra.shape[:2]
-        if w > self.max_width:
-            scale = self.max_width / w
+        target_w, target_h = 0, 0
+        if self.target_size is not None:
+            with self.target_size.get_lock():
+                target_w, target_h = self.target_size[:]
+        new_w, new_h = fit_frame_size(w, h, self.max_width, target_w, target_h)
+        if (new_w, new_h) != (w, h):
             bgra = cv2.resize(
-                bgra, (self.max_width, max(1, int(h * scale))), interpolation=cv2.INTER_AREA,
+                bgra, (new_w, new_h), interpolation=cv2.INTER_AREA,
             )
         rgb = cv2.cvtColor(bgra, cv2.COLOR_BGRA2RGB)
         h, w = rgb.shape[:2]
@@ -252,7 +259,7 @@ def _run_printwindow(hwnd, writer, hwnd_shared, stop_event, pause_event, target_
 
 def run_capture_process(
     hwnd_shared, max_width, target_fps, shm_name, slot_nbytes, meta_array,
-    latest_slot, stop_event, pause_event,
+    latest_slot, stop_event, pause_event, target_size=None,
 ):
     """在獨立行程裡執行的主迴圈。跟主行程（語音辨識/翻譯/UI）完全分開跑，
     各自有自己的直譯器和 GIL，彼此不會互搶執行權。
@@ -279,7 +286,7 @@ def run_capture_process(
     except Exception:
         pass
 
-    writer = _SlotWriter(shm_name, slot_nbytes, meta_array, latest_slot, max_width)
+    writer = _SlotWriter(shm_name, slot_nbytes, meta_array, latest_slot, max_width, target_size)
     printwindow_hwnds = set()  # 這些視窗 WGC 會抓到黑畫面，直接用 PrintWindow
     try:
         while not stop_event.is_set():
