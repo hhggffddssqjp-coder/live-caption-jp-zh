@@ -3,6 +3,7 @@
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -108,6 +109,74 @@ class RingClockTests(unittest.TestCase):
 		self.assertAlmostEqual(ring.latest_time(), 500.0)
 		self.write_steady(ring, 500.0, 30)
 		self.assertEqual(ring.total_written, before + 30 * BLOCK)
+
+
+class RingGapTests(unittest.TestCase):
+	def test_gap_larger_than_capacity_keeps_silence_and_new_audio(self):
+		ring = AudioRingBuffer(SR, 0.1, channels=2)
+		ring.write(block(1, n=27), captured_end=0.027)
+		ring.write(block(2, n=13), captured_end=0.340)  # 缺口 300 個樣本
+		self.assertEqual(ring.total_written, 340)
+		self.assertEqual(ring.write_pos, 40)
+		self.assertEqual(ring.start_time, 0.0)
+		self.assertAlmostEqual(ring.latest_time(), 0.340)
+		expected = np.concatenate([block(0, n=87), block(2, n=13)])
+		np.testing.assert_array_equal(ring.read_at(0.240, 100), expected)
+		self.assertTrue(np.all(ring.read_at(0.0, 27) == 0))
+
+	def test_hours_long_gap_never_allocates_more_than_capacity(self):
+		sample_rate = 48000
+		ring = AudioRingBuffer(sample_rate, 0.1, channels=2)
+		ring.write(block(1, n=240), captured_end=0.005)
+		gap_samples = 6 * 3600 * sample_rate
+		real_zeros = np.zeros
+		allocations = []
+
+		def bounded_zeros(shape, *args, **kwargs):
+			# 先擋住過大的配置，舊版失敗時也不會真的配置數 GB。
+			self.assertLessEqual(shape[0], ring.max_samples)
+			allocations.append(shape)
+			return real_zeros(shape, *args, **kwargs)
+
+		with mock.patch("audio_timing.np.zeros", side_effect=bounded_zeros):
+			ring.write(block(2, n=240), captured_end=21600.010)
+		self.assertTrue(allocations)
+		self.assertEqual(ring.total_written, gap_samples + 480)
+		self.assertEqual(ring.write_pos, ring.total_written % ring.max_samples)
+		self.assertAlmostEqual(ring.latest_time(), 21600.010)
+		expected = np.concatenate([block(0, n=4560), block(2, n=240)])
+		np.testing.assert_array_equal(ring.read_at(21599.910, 4800), expected)
+
+	def test_wrapped_reads_match_full_gap_storage(self):
+		# 以舊版「整段補零再 _store」作為參照，涵蓋缺口與新資料跨過容量邊界。
+		for gap in (64, 128, 333):
+			for channels in (1, 2):
+				for new_count in (19, 160):
+					with self.subTest(gap=gap, channels=channels, new_count=new_count):
+						ring = AudioRingBuffer(1024, 0.125, channels=channels)
+						reference = AudioRingBuffer(1024, 0.125, channels=channels)
+						initial = np.arange(211 * channels, dtype=np.float32).reshape(211, channels)
+						new_audio = np.full((new_count, channels), -1, dtype=np.float32)
+						for buffer in (ring, reference):
+							buffer.write(initial, captured_end=211 / 1024)
+						ring.write(new_audio, captured_end=(211 + gap + new_count) / 1024)
+						reference._store(np.zeros((gap, channels), dtype=np.float32))
+						reference._store(new_audio)
+						self.assertEqual(ring.total_written, reference.total_written)
+						self.assertEqual(ring.write_pos, reference.write_pos)
+						np.testing.assert_array_equal(ring.buffer, reference.buffer)
+						for start in (0, ring.total_written - 148, ring.total_written - 50, ring.total_written):
+							np.testing.assert_array_equal(
+								ring.read_at(start / 1024, 180), reference.read_at(start / 1024, 180),
+							)
+						# 再繞一圈後，略過的缺口前段也不能影響後續資料。
+						for buffer in (ring, reference):
+							buffer.write(initial)
+						np.testing.assert_array_equal(ring.buffer, reference.buffer)
+						np.testing.assert_array_equal(
+							ring.read_at(ring.latest_time() - 0.125, 128),
+							reference.read_at(reference.latest_time() - 0.125, 128),
+						)
 
 
 class PlaybackDriftTrackerTests(unittest.TestCase):
