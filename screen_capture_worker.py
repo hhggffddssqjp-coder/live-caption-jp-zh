@@ -3,12 +3,10 @@ screen_capture_worker.py
 畫面擷取邏輯的獨立行程（process）版本，給 live_caption_gemini.py 的
 ScreenCapture 呼叫。
 
-刻意獨立成這個檔案、只 import 這裡真正需要的東西（不 import
-live_caption_gemini.py 本體），是因為 Windows 上開新的 process（spawn 模式）
-時，會重新 import 目標函式所在的整個模組——如果擷取邏輯寫在
-live_caption_gemini.py 裡面，等於每次開這個擷取 process 都要連 torch、
-faster-whisper 這些大型函式庫也一起重新 import 一次，白白拖慢啟動速度、
-浪費記憶體。獨立成這個輕量檔案，新開的 process 幾乎是瞬間啟動。
+這裡只 import 擷取真正需要的套件。Windows spawn 會先以 __mp_main__
+重跑父行程的入口，再載入 target 所在的模組，所以只把 target 拆出來還不夠。
+live_caption_gemini.py 也必須保持輕量：只有真正啟動主程式或一般 import 時，
+才載入 caption_app.py 的 torch、faster-whisper 等相依套件。
 
 為什麼要搬成獨立 process（而不是原本的執行緒）：
 Python 同一個「行程」裡，不管開幾條執行緒，同一時間真正在執行 Python

@@ -7,7 +7,7 @@ import unittest
 
 class FrameBufferConfigTests(unittest.TestCase):
     def test_video_margin_does_not_change_audio_retention(self):
-        source = Path(__file__).resolve().parents[1] / "live_caption_gemini.py"
+        source = Path(__file__).resolve().parents[1] / "caption_app.py"
         tree = ast.parse(source.read_text(encoding="utf-8"))
         constants = {
             node.targets[0].id: node.value.value
