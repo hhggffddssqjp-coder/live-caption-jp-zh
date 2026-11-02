@@ -138,6 +138,7 @@ def import_application():
 		"sounddevice": types.ModuleType("sounddevice"),
 		"tkinter": tkinter, "tkinter.scrolledtext": tkinter.scrolledtext,
 	})
+	sys.modules.pop("caption_app", None)
 	sys.modules.pop("live_caption_gemini", None)
 	return importlib.import_module("live_caption_gemini")
 
@@ -996,7 +997,7 @@ class KeptRecordingCommandTests(TranslationBackendTestCase):
 		script, wav = match.groups()
 		# Absolute paths, so the command works whichever folder it is pasted into.
 		self.assertTrue(os.path.isabs(script) and os.path.isabs(wav), match.group(0))
-		self.assertTrue(os.path.samefile(script, self.app.__file__), script)
+		self.assertTrue(os.path.samefile(script, Path(self.app.__file__).with_name("live_caption_gemini.py")), script)
 		self.assertTrue(os.path.samefile(wav, wav_path), wav)
 
 	def test_rebuild_command_makes_a_relative_recording_path_absolute(self):
