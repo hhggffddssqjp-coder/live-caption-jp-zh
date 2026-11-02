@@ -117,6 +117,7 @@ from PIL import Image, ImageTk
 from faster_whisper import WhisperModel
 from silero_vad import load_silero_vad, VADIterator
 from audio_timing import AudioRingBuffer, EnergySpeechGate, PlaybackDriftTracker  # 純邏輯，可以單獨測試
+from frame_buffer import FrameBuffer
 from local_translation import (
     TRANSLATION_FAILED_TEXT, LocalTranslationEngine, bilingual_pairs_acceptable, parse_bilingual_pairs,
     translation_problem,
@@ -940,34 +941,6 @@ class PauseState:
             return False
         self.event.set()
         return True
-
-
-class FrameBuffer:
-    """執行緒安全的畫面緩衝區：擷取執行緒寫入畫面，播放視窗讀取「N 秒前」的那一張"""
-
-    def __init__(self, max_seconds: float):
-        self.max_seconds = max_seconds
-        self.lock = threading.Lock()
-        self.frames = deque()  # [(timestamp, PIL.Image)]，依時間先後排列
-
-    def push(self, ts: float, image):
-        with self.lock:
-            self.frames.append((ts, image))
-            cutoff = ts - self.max_seconds
-            while self.frames and self.frames[0][0] < cutoff:
-                self.frames.popleft()
-
-    def get_at(self, target_ts: float):
-        with self.lock:
-            if not self.frames:
-                return None
-            best = self.frames[0][1]
-            for ts, image in self.frames:
-                if ts <= target_ts:
-                    best = image
-                else:
-                    break
-            return best
 
 
 class ScreenCapture:
