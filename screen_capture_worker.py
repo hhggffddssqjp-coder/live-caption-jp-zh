@@ -26,10 +26,9 @@ Python 同一個「行程」裡，不管開幾條執行緒，同一時間真正�
 過這條管道，明顯撐不住，畫面因此掉幀、卡頓，看起來就像聲音畫面對不上（其實
 聲音那邊完全正常，只是畫面追不上）。改成用共享記憶體：擷取行程直接把畫面
 位元組寫進一塊主行程也看得到的記憶體，完全不用序列化/複製，主行程直接讀。
-用 3 個輪替的緩衝格（slot）而不是 1 個，讀寫各自有餘裕，不用加鎖也不會撞在
-一起——寫入端寫完一格才把「目前最新是哪一格」這個索引更新，讀取端永遠讀
-「已經完整寫完的那一格」，寫入端要繞回來蓋掉同一格之前，讀取端早就讀完/
-複製走了（一輪只需要複製幾 MB，遠比一張畫面的產生時間快很多）。
+用 3 個輪替的緩衝格（slot）給讀寫各自餘裕；每格另有 uint64 序號，寫入中是
+奇數、完成後是偶數。讀取端複製前後核對序號，若寫入端已繞回覆寫就丟棄重讀，
+不再假設主行程一定能在三格輪完之前複製完成。
 """
 
 import ctypes
@@ -39,10 +38,30 @@ from multiprocessing import shared_memory
 import cv2
 import numpy as np
 
-from frame_pipeline import fit_frame_size
+from frame_pipeline import PublishLimiter, fit_frame_size
 
 PW_RENDERFULLCONTENT = 0x00000002
-NUM_SLOTS = 3  # 輪替緩衝格數，3 格給讀寫雙方足夠餘裕，不用額外加鎖
+NUM_SLOTS = 3  # 像素複製不持有鎖，一致性由每格序號檢查
+
+
+def read_latest_frame(slots, meta_array, sequences, latest_slot, last_frame_id):
+    """取得一致的新影格；遇到寫入中、覆寫中或舊影格，回傳 None 讓接收端稍後重讀。"""
+    slot = latest_slot.value
+    if not 0 <= slot < NUM_SLOTS:
+        return None
+    before = sequences[slot]
+    if before == 0 or before & 1 or before // 2 <= last_frame_id:
+        return None
+    idx = slot * 3
+    h, w = int(meta_array[idx]), int(meta_array[idx + 1])
+    ts = meta_array[idx + 2]
+    nbytes = h * w * 3
+    if h <= 0 or w <= 0 or nbytes > slots.shape[1]:
+        return None
+    frame = slots[slot, :nbytes].reshape(h, w, 3).copy()
+    if sequences[slot] != before:
+        return None
+    return before // 2, ts, frame
 
 
 def _capture_once(hwnd: int):
@@ -91,7 +110,7 @@ class _SlotWriter:
     """把一張 BGRA 畫面縮放、轉成 RGB，寫進共享記憶體的下一格。
     WGC 的回呼執行緒跟 PrintWindow 迴圈都用這一個，寫入規則只有一份。"""
 
-    def __init__(self, shm_name, slot_nbytes, meta_array, latest_slot, max_width, target_size=None):
+    def __init__(self, shm_name, slot_nbytes, meta_array, latest_slot, max_width, target_size, sequences):
         self.shm = shared_memory.SharedMemory(name=shm_name)
         self.slots = np.ndarray((NUM_SLOTS, slot_nbytes), dtype=np.uint8, buffer=self.shm.buf)
         self.slot_nbytes = slot_nbytes
@@ -99,6 +118,8 @@ class _SlotWriter:
         self.latest_slot = latest_slot
         self.max_width = max_width
         self.target_size = target_size
+        self.sequences = sequences
+        self.frame_id = 0
         self.write_slot = 0
 
     def write(self, bgra: np.ndarray) -> None:
@@ -120,11 +141,17 @@ class _SlotWriter:
             # 一般影片視窗不會比它還高），真的遇到就跳過這張避免寫爆記憶體
             print(f"[擷取行程] 畫面 {w}x{h} 超出共享記憶體容量，跳過這一張")
             return
+        self.frame_id += 1
+        # 序號使用獨立 uint64，不塞進 double metadata（超過 2**53 就無法逐一計數）。
+        # 單一 writer 的 frame id 跨槽遞增，完成序號 = frame id * 2；實務上不會繞回。
+        # synchronized Array 的短鎖也提供跨行程記憶體同步；大塊像素複製不持有鎖。
+        self.sequences[self.write_slot] = self.frame_id * 2 - 1
         self.slots[self.write_slot, :nbytes] = rgb.reshape(-1)
         idx = self.write_slot * 3
         self.meta_array[idx] = h
         self.meta_array[idx + 1] = w
         self.meta_array[idx + 2] = time.time()
+        self.sequences[self.write_slot] = self.frame_id * 2
         self.latest_slot.value = self.write_slot
         self.write_slot = (self.write_slot + 1) % NUM_SLOTS
 
@@ -136,7 +163,7 @@ def _is_black(bgra: np.ndarray) -> bool:
     return float(bgra[::16, ::16, :3].mean()) < BLACK_MEAN_THRESHOLD
 
 
-def _run_wgc(hwnd, writer, hwnd_shared, stop_event, pause_event) -> str:
+def _run_wgc(hwnd, writer, hwnd_shared, stop_event, pause_event, target_fps=60) -> str:
     """用 Windows Graphics Capture 擷取，直到結束、切換視窗或需要退回 PrintWindow。
 
     WGC 是影片每換一格就主動送一張過來（跟 OBS 視窗擷取同一套），不像
@@ -148,6 +175,7 @@ def _run_wgc(hwnd, writer, hwnd_shared, stop_event, pause_event) -> str:
     一直拿到黑畫面，但 PrintWindow 抓得到內容，改用 PrintWindow）、"error"。
     """
     state = {"black_since": None, "fallback": False}
+    limiter = PublishLimiter(target_fps)
 
     # 用 git pull 更新卻沒重跑 pip install 的人會缺這個套件或停在舊版，
     # 這裡失敗要回 "error" 讓這個視窗改用 PrintWindow，不能讓整個擷取行程掛掉
@@ -183,6 +211,9 @@ def _run_wgc(hwnd, writer, hwnd_shared, stop_event, pause_event) -> str:
             control.stop()
             return
         if pause_event.is_set():
+            return
+        # 在碰像素、轉色、縮放或寫入之前先限速，避免高更新率螢幕白做整套運算。
+        if not limiter.allow(time.perf_counter()):
             return
         try:
             bgra = frame.frame_buffer
@@ -259,7 +290,7 @@ def _run_printwindow(hwnd, writer, hwnd_shared, stop_event, pause_event, target_
 
 def run_capture_process(
     hwnd_shared, max_width, target_fps, shm_name, slot_nbytes, meta_array,
-    latest_slot, stop_event, pause_event, target_size=None,
+    latest_slot, stop_event, pause_event, target_size, sequences,
 ):
     """在獨立行程裡執行的主迴圈。跟主行程（語音辨識/翻譯/UI）完全分開跑，
     各自有自己的直譯器和 GIL，彼此不會互搶執行權。
@@ -270,9 +301,9 @@ def run_capture_process(
 
     shm_name/slot_nbytes：主行程建立好的共享記憶體名稱、每一格的大小上限。
     meta_array：長度 NUM_SLOTS*3 的 double 陣列，依序存每一格的 (height, width,
-    timestamp)——寫完畫面位元組後才寫這三個值，最後才更新 latest_slot，
-    讀取端看到 latest_slot 換了，才會去讀對應那一格的 meta/畫面，保證讀到的
-    一定是完整寫完的一份。
+    timestamp)。sequences 是 NUM_SLOTS 個 uint64，奇數代表寫入中，偶數的一半
+    是完成影格的 frame id；寫完像素與 metadata 才設偶數、更新 latest_slot。
+    讀取端以 frame id 判斷新舊，並在複製前後核對序號，槽號繞圈也不會漏判。
     """
     try:
         import win32api
@@ -286,7 +317,7 @@ def run_capture_process(
     except Exception:
         pass
 
-    writer = _SlotWriter(shm_name, slot_nbytes, meta_array, latest_slot, max_width, target_size)
+    writer = _SlotWriter(shm_name, slot_nbytes, meta_array, latest_slot, max_width, target_size, sequences)
     printwindow_hwnds = set()  # 這些視窗 WGC 會抓到黑畫面，直接用 PrintWindow
     try:
         while not stop_event.is_set():
@@ -294,7 +325,7 @@ def run_capture_process(
             if hwnd in printwindow_hwnds:
                 result = _run_printwindow(hwnd, writer, hwnd_shared, stop_event, pause_event, target_fps)
             else:
-                result = _run_wgc(hwnd, writer, hwnd_shared, stop_event, pause_event)
+                result = _run_wgc(hwnd, writer, hwnd_shared, stop_event, pause_event, target_fps)
                 if result in ("fallback", "error"):
                     printwindow_hwnds.add(hwnd)
             if result == "stop":

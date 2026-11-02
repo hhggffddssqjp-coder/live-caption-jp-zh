@@ -957,8 +957,8 @@ class ScreenCapture:
     pickle 序列化、複製進系統管道，1920 寬、60fps 的資料量（一秒幾百 MB）
     撐不住，會掉幀、卡頓；共享記憶體是直接讀寫同一塊記憶體，沒有序列化/複製
     的成本。用 3 個輪替緩衝格（見 screen_capture_worker.NUM_SLOTS），寫入端
-    寫完整格才更新「最新是哪一格」的索引，讀取端只讀完整寫完的那一格，繞一圈
-    回來蓋掉同一格之前，讀取端早就複製走了，不用額外加鎖。
+    以每格 uint64 序號標記寫入中/已完成；讀取端複製前後核對序號，避免主行程
+    暫時忙碌、寫入端繞圈覆寫時讀到不完整畫面，並以 frame id 判斷是否有新影格。
 
     對外行為跟原本的執行緒版本完全一樣：start()/stop()/switch_window()，
     呼叫端不用改。
@@ -995,6 +995,7 @@ class ScreenCapture:
         )
         # 每格存 (height, width, timestamp) 三個值
         self._meta = multiprocessing.Array(ctypes.c_double, self.NUM_SLOTS * 3)
+        self._sequences = multiprocessing.Array(ctypes.c_uint64, self.NUM_SLOTS)
         self._latest_slot = multiprocessing.Value(ctypes.c_int, -1)  # -1 = 還沒有任何畫面
 
         self._stop_event = multiprocessing.Event()
@@ -1012,7 +1013,7 @@ class ScreenCapture:
                 self._hwnd_shared, self.max_width, self.target_fps,
                 self._shm.name, self._slot_nbytes, self._meta,
                 self._latest_slot, self._stop_event, self._pause_event,
-                self.target_size,
+                self.target_size, self._sequences,
             ),
             daemon=True,
         )
@@ -1025,7 +1026,9 @@ class ScreenCapture:
         self._receiver_thread.start()
 
     def _receive_loop(self):
-        last_seen = -1
+        from screen_capture_worker import read_latest_frame
+
+        last_seen = 0
         while not self._receiver_stop.is_set():
             # 把主行程這邊的暫停旗標同步給擷取行程，按暫停時畫面擷取才會一起停
             if self.pause_state is not None:
@@ -1034,18 +1037,13 @@ class ScreenCapture:
                 else:
                     self._pause_event.clear()
 
-            slot = self._latest_slot.value
-            if slot == -1 or slot == last_seen:
+            snapshot = read_latest_frame(
+                self._shm_view, self._meta, self._sequences, self._latest_slot, last_seen,
+            )
+            if snapshot is None:
                 time.sleep(0.005)
                 continue
-            last_seen = slot
-
-            idx = slot * 3
-            h = int(self._meta[idx])
-            w = int(self._meta[idx + 1])
-            ts = self._meta[idx + 2]
-            nbytes = h * w * 3
-            frame = self._shm_view[slot, :nbytes].reshape(h, w, 3).copy()
+            last_seen, ts, frame = snapshot
             self.frame_buffer.push(ts, frame)
 
     def switch_window(self, hwnd: int):

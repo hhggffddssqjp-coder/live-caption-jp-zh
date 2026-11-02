@@ -49,3 +49,24 @@ class DebouncedSize:
         self._job = self._pending = None
         self._published = size
         self.publish(*size)
+
+
+class PublishLimiter:
+    """只決定這次是否發布，不 sleep；沿固定時間格點取樣，停頓後不追補。"""
+
+    def __init__(self, target_fps):
+        if target_fps <= 0:
+            raise ValueError("目標 fps 必須大於 0")
+        self.interval = 1.0 / target_fps
+        self.next_publish = None
+
+    def allow(self, now):
+        if self.next_publish is None:
+            self.next_publish = now
+        # 只容忍浮點加法的微小誤差，避免剛好在格點的回呼被誤判為過早。
+        if now + 1e-9 < self.next_publish:
+            return False
+        self.next_publish += self.interval
+        if now - self.next_publish >= self.interval:
+            self.next_publish = now + self.interval
+        return True

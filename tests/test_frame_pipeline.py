@@ -2,7 +2,7 @@
 
 import unittest
 
-from frame_pipeline import DebouncedSize, fit_frame_size
+from frame_pipeline import DebouncedSize, PublishLimiter, fit_frame_size
 
 
 class FrameSizeTests(unittest.TestCase):
@@ -92,6 +92,31 @@ class DebouncedSizeTests(unittest.TestCase):
         self.size.update(640, 360)
         self.clock.advance(300)
         self.assertEqual(self.sizes, [(640, 360)])
+
+
+class PublishLimiterTests(unittest.TestCase):
+    def test_callback_rates_follow_target_without_extra_publications(self):
+        for input_hz in (30, 60, 120, 165):
+            for target in (30, 60):
+                with self.subTest(input_hz=input_hz, target=target):
+                    limiter = PublishLimiter(target)
+                    accepted = [i / input_hz for i in range(input_hz * 10)
+                                if limiter.allow(i / input_hz)]
+                    self.assertEqual(len(accepted), min(input_hz, target) * 10)
+                    gaps = [b - a for a, b in zip(accepted, accepted[1:])]
+                    self.assertLessEqual(max(gaps) - min(gaps), 1 / input_hz + 1e-8)
+
+    def test_long_pause_resets_schedule_without_catchup_burst(self):
+        limiter = PublishLimiter(60)
+        self.assertTrue(limiter.allow(0))
+        self.assertTrue(limiter.allow(10))
+        self.assertFalse(limiter.allow(10))
+        self.assertFalse(limiter.allow(10.001))
+        self.assertTrue(limiter.allow(10 + 1 / 60))
+
+    def test_invalid_target(self):
+        with self.assertRaises(ValueError):
+            PublishLimiter(0)
 
 
 if __name__ == "__main__":

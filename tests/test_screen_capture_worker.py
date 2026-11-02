@@ -4,6 +4,7 @@ windows_capture is swapped in sys.modules per test, so nothing here needs Window
 """
 
 import importlib
+import ctypes
 import os
 import re
 import sys
@@ -165,8 +166,180 @@ class WgcUnavailableTests(unittest.TestCase):
 				mock.patch.object(worker, "_run_printwindow", fake_printwindow):
 			worker.run_capture_process(
 				hwnd_shared, 1280, 60, "shm", 0, None, None, StopAfter(checks=5), threading.Event(),
+				None, None,
 			)
 		self.assertEqual(printwindow_hwnds, [HWND])
+
+
+class FakePixels:
+	def __init__(self, height, width, channels=4):
+		self.shape = (height, width, channels)
+		self.nbytes = height * width * channels
+
+	def reshape(self, *args):
+		return self
+
+
+class FakeSlots:
+	"""只模擬像素複製介面，可在複製或寫入途中插入另一端的操作。"""
+
+	def __init__(self, capacity=100):
+		self.shape = (worker.NUM_SLOTS, capacity)
+		self.on_copy = lambda: None
+		self.on_write = lambda: None
+		self.copies = 0
+		self.pixels = [None] * worker.NUM_SLOTS
+
+	def __getitem__(self, key):
+		slot, _ = key
+		pixels = self.pixels[slot]
+
+		def copy():
+			self.copies += 1
+			self.on_copy()
+			return pixels
+
+		return types.SimpleNamespace(reshape=lambda *shape: types.SimpleNamespace(copy=copy))
+
+	def __setitem__(self, key, pixels):
+		self.on_write()
+		self.pixels[key[0]] = pixels
+
+
+class SharedFrameTests(unittest.TestCase):
+	def setUp(self):
+		self.slots = FakeSlots()
+		self.meta = (ctypes.c_double * (worker.NUM_SLOTS * 3))()
+		self.seq = (ctypes.c_uint64 * worker.NUM_SLOTS)()
+		self.latest = types.SimpleNamespace(value=-1)
+
+	def complete(self, slot, frame_id):
+		idx = slot * 3
+		self.meta[idx:idx + 3] = [2, 3, 100.5]
+		self.seq[slot] = frame_id * 2
+		self.latest.value = slot
+		self.slots.pixels[slot] = "complete pixels"
+
+	def read(self, last=0):
+		return worker.read_latest_frame(self.slots, self.meta, self.seq, self.latest, last)
+
+	def test_odd_sequence_rejects_write_in_progress_before_copy(self):
+		self.assertIsNone(self.read())
+		self.complete(0, 1)
+		self.seq[0] = 3
+		self.assertIsNone(self.read())
+		self.assertEqual(self.slots.copies, 0)
+
+	def test_overwrite_during_copy_is_rejected_even_if_writer_finishes(self):
+		for after in (3, 8):
+			with self.subTest(after=after):
+				self.complete(0, 1)
+				self.slots.on_copy = lambda: self.seq.__setitem__(0, after)
+				self.assertIsNone(self.read())
+		self.slots.on_copy = lambda: None
+		self.assertEqual(self.read(), (4, 100.5, "complete pixels"))
+
+	def test_same_slot_after_full_rotation_is_a_new_frame(self):
+		self.complete(0, 1)
+		self.assertEqual(self.read()[0], 1)
+		self.assertIsNone(self.read(last=1))
+		self.complete(0, 4)
+		self.assertEqual(self.read(last=1)[0], 4)
+
+	def test_frame_id_above_double_precision_remains_exact(self):
+		frame_id = 2**53 + 1
+		self.complete(2, frame_id)
+		self.assertEqual(self.read(last=frame_id - 1)[0], frame_id)
+		self.assertIsNone(self.read(last=frame_id))
+
+	def test_invalid_dimensions_are_not_copied(self):
+		self.complete(0, 1)
+		for height, width in ((0, 3), (100, 100), (-1, 3)):
+			self.meta[0:2] = [height, width]
+			self.assertIsNone(self.read())
+		self.assertEqual(self.slots.copies, 0)
+
+	def make_writer(self, max_width=1920, target=None):
+		writer = worker._SlotWriter.__new__(worker._SlotWriter)
+		writer.slots = self.slots
+		writer.meta_array = self.meta
+		writer.sequences = self.seq
+		writer.latest_slot = self.latest
+		writer.max_width = max_width
+		writer.target_size = target
+		writer.slot_nbytes = 1920 * 1920 * 3
+		writer.write_slot = writer.frame_id = 0
+		return writer
+
+	def fake_cv2(self):
+		return types.SimpleNamespace(
+			INTER_AREA=3, COLOR_BGRA2RGB=5,
+			resize=mock.Mock(side_effect=lambda img, size, **kw: FakePixels(size[1], size[0])),
+			cvtColor=mock.Mock(side_effect=lambda img, code: FakePixels(*img.shape[:2], 3)),
+		)
+
+	def test_writer_marks_odd_before_pixels_and_even_before_latest(self):
+		writer = self.make_writer()
+		observed = []
+		self.slots.on_write = lambda: observed.append((self.seq[writer.write_slot], self.latest.value))
+		with mock.patch.object(worker, "cv2", self.fake_cv2()):
+			for _ in range(4):
+				writer.write(FakePixels(2, 3))
+		self.assertEqual(observed, [(1, -1), (3, 0), (5, 1), (7, 2)])
+		self.assertEqual(list(self.seq), [8, 4, 6])
+		self.assertEqual(self.read(last=1)[0], 4)
+
+	def test_writer_resizes_before_color_conversion_using_shared_target(self):
+		target = mock.MagicMock()
+		target.__getitem__.return_value = [1280, 720]
+		writer = self.make_writer(target=target)
+		cv = self.fake_cv2()
+		with mock.patch.object(worker, "cv2", cv):
+			writer.write(FakePixels(1080, 1920))
+		cv.resize.assert_called_once()
+		self.assertEqual(cv.resize.call_args.args[1], (1280, 720))
+		self.assertEqual(cv.resize.call_args.kwargs, {"interpolation": cv.INTER_AREA})
+		self.assertEqual(cv.cvtColor.call_args.args[0].shape, (720, 1280, 4))
+		self.assertEqual(list(self.meta[:2]), [720, 1280])
+
+
+class WgcPublishTests(unittest.TestCase):
+	def test_callback_throttles_before_accessing_pixels(self):
+		class Frame:
+			reads = 0
+
+			@property
+			def frame_buffer(self):
+				self.reads += 1
+				return "pixels"
+
+		class Capture:
+			def __init__(self, **kwargs):
+				self.handlers = {}
+
+			def event(self, callback):
+				self.handlers[callback.__name__] = callback
+				return callback
+
+			def start_free_threaded(self):
+				for _ in range(120):
+					self.handlers["on_frame_arrived"](frame, control)
+				stop.set()
+				return control
+
+		stop = threading.Event()
+		frame = Frame()
+		control = mock.Mock()
+		control.is_finished.return_value = True
+		writer = mock.Mock()
+		with mock.patch.dict(sys.modules, {"windows_capture": fake_windows_capture(Capture)}), \
+				mock.patch.object(worker.time, "perf_counter", side_effect=[i / 120 for i in range(120)]), \
+				mock.patch.object(worker, "_is_black", return_value=False):
+			result = worker._run_wgc(HWND, writer, types.SimpleNamespace(value=HWND),
+									 stop, threading.Event(), target_fps=30)
+		self.assertEqual(result, "stop")
+		self.assertEqual(writer.write.call_count, 30)
+		self.assertEqual(frame.reads, 30)
 
 
 if __name__ == "__main__":
