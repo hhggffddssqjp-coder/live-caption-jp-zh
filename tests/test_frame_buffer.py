@@ -15,30 +15,31 @@ def image(nbytes=6):
 
 
 class FrameBufferTests(unittest.TestCase):
-    def test_limit_rejects_new_image_without_removing_oldest(self):
-        buf = FrameBuffer(16, max_bytes=12)
-        first, second = image(), image()
-        self.assertTrue(buf.push(1, first))
-        self.assertTrue(buf.push(2, second))
+    def test_limit_thins_evenly_and_keeps_the_oldest_frame(self):
+        buf = FrameBuffer(16, max_bytes=60)  # 放得下 10 張
+        frames = [image() for _ in range(40)]
         with mock.patch("builtins.print") as printed:
-            self.assertFalse(buf.push(3, image()))
-            self.assertFalse(buf.push(4, image()))
+            accepted = [buf.push(i / 60, frame) for i, frame in enumerate(frames)]
         self.assertEqual(printed.call_count, 1)
-        self.assertEqual(list(buf.frames), [(1, first), (2, second)])
-        self.assertEqual(buf.total_bytes, 12)
-        self.assertIs(buf.get_at(1.5), first)
+        self.assertTrue(accepted[0] and accepted[10])  # 第一次碰上限時新影格照收
+        self.assertIs(buf.frames[0][1], frames[0])  # 延遲起點沒被剪掉
+        self.assertLessEqual(buf.total_bytes, 60)
+        stamps = [ts for ts, _ in buf.frames]
+        gaps = [b - a for a, b in zip(stamps, stamps[1:])]
+        # 沒有好幾秒的空檔：最大間隔只是原本的幾倍，不是整段停住
+        self.assertLessEqual(max(gaps), 8 / 60 + 1e-9)
+        self.assertEqual(buf.total_bytes, sum(f.nbytes for _, f in buf.frames))
 
-    def test_expiration_updates_bytes_even_when_new_image_is_rejected(self):
-        buf = FrameBuffer(2, max_bytes=12)
-        buf.push(1, image(5))
-        buf.push(2, image(7))
+    def test_density_recovers_when_usage_drops(self):
+        buf = FrameBuffer(1, max_bytes=600)
         with mock.patch("builtins.print"):
-            self.assertFalse(buf.push(3, image(1)))  # 邊界 ts=1 仍保留
-            self.assertFalse(buf.push(3.1, image(6)))  # 只自然剪除 ts=1
-        self.assertEqual(buf.total_bytes, 7)
-        self.assertTrue(buf.push(4.1, image(9)))
-        self.assertEqual(buf.total_bytes, 9)
-        self.assertEqual(len(buf.frames), 1)
+            for i in range(30):
+                buf.push(i / 60, image(60))
+            self.assertGreater(buf._stride, 1)
+            # 視窗縮小：之後的影格小很多（全密度也只用 60 bytes），用量掉到四分之一以下就逐步恢復
+            for i in range(30, 400):
+                buf.push(i / 60, image(1))
+        self.assertEqual(buf._stride, 1)
 
     def test_oversized_frame_is_never_retained(self):
         buf = FrameBuffer(16, max_bytes=5)
@@ -84,7 +85,7 @@ class FrameBufferTests(unittest.TestCase):
     def test_environment_override_and_invalid_values(self):
         with mock.patch.dict(os.environ, {"CAPTION_FRAME_BUFFER_MB": "1.5"}):
             self.assertEqual(frame_buffer._frame_buffer_mb(), 1.5)
-        for raw in ("", "0", "-1", "nan", "inf", "oops"):
+        for raw in ("", "0", "-1", "nan", "inf", "oops", "1e308", "1e20"):
             with self.subTest(raw=raw), mock.patch.dict(os.environ, {"CAPTION_FRAME_BUFFER_MB": raw}), \
                     mock.patch("builtins.print"):
                 with mock.patch.object(frame_buffer, "_default_frame_buffer_mb", return_value=32768.0):
